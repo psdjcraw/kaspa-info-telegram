@@ -39,6 +39,7 @@ class Ticker:
     unit: str
     ok: bool = True
     error: str = ""
+    volume_change_pct: float | None = None
 
 
 @dataclass
@@ -242,6 +243,88 @@ FETCHERS: list[Callable[[], Ticker]] = [
 ]
 
 
+def previous_24h_volume(candles: list[tuple[int, float]]) -> float | None:
+    candles = [(ts, volume) for ts, volume in candles if volume > 0]
+    if not candles:
+        return None
+    latest_ts = max(ts for ts, _ in candles)
+    previous_end = latest_ts - 24 * 60 * 60
+    previous_start = previous_end - 24 * 60 * 60
+    volume = sum(volume for ts, volume in candles if previous_start <= ts < previous_end)
+    return volume or None
+
+
+def fetch_gate_previous_volume() -> float | None:
+    payload = http_json(
+        "https://api.gateio.ws/api/v4/spot/candlesticks?"
+        "currency_pair=KAS_USDT&interval=1h&limit=48"
+    )
+    return previous_24h_volume([(int(row[0]), float(row[6])) for row in payload])
+
+
+def fetch_mexc_previous_volume() -> float | None:
+    payload = http_json("https://api.mexc.com/api/v3/klines?symbol=KASUSDT&interval=60m&limit=48")
+    return previous_24h_volume([(int(int(row[0]) / 1000), float(row[5])) for row in payload])
+
+
+def fetch_kucoin_previous_volume() -> float | None:
+    now = int(time.time())
+    payload = http_json(
+        "https://api.kucoin.com/api/v1/market/candles?"
+        f"symbol=KAS-USDT&type=1hour&startAt={now - 49 * 60 * 60}&endAt={now}"
+    )
+    return previous_24h_volume([(int(row[0]), float(row[5])) for row in payload["data"]])
+
+
+def fetch_bybit_previous_volume() -> float | None:
+    payload = http_json("https://api.bybit.com/v5/market/kline?category=spot&symbol=KASUSDT&interval=60&limit=48")
+    rows = payload["result"]["list"]
+    return previous_24h_volume([(int(int(row[0]) / 1000), float(row[5])) for row in rows])
+
+
+def fetch_bitget_previous_volume() -> float | None:
+    payload = http_json("https://api.bitget.com/api/v2/spot/market/candles?symbol=KASUSDT&granularity=1h&limit=48")
+    return previous_24h_volume([(int(int(row[0]) / 1000), float(row[5])) for row in payload["data"]])
+
+
+def fetch_kraken_previous_volume() -> float | None:
+    since = int(time.time()) - 49 * 60 * 60
+    payload = http_json(f"https://api.kraken.com/0/public/OHLC?pair=KASUSD&interval=60&since={since}")
+    rows = payload["result"].get("KASUSD", [])
+    return previous_24h_volume([(int(row[0]), float(row[6])) for row in rows])
+
+
+def fetch_htx_previous_volume() -> float | None:
+    payload = http_json("https://api.huobi.pro/market/history/kline?symbol=kasusdt&period=60min&size=48")
+    return previous_24h_volume([(int(row["id"]), float(row["amount"])) for row in payload["data"]])
+
+
+VOLUME_HISTORY_FETCHERS: dict[str, Callable[[], float | None]] = {
+    "Gate": fetch_gate_previous_volume,
+    "MEXC": fetch_mexc_previous_volume,
+    "KuCoin": fetch_kucoin_previous_volume,
+    "Bybit": fetch_bybit_previous_volume,
+    "Bitget": fetch_bitget_previous_volume,
+    "Kraken": fetch_kraken_previous_volume,
+    "HTX": fetch_htx_previous_volume,
+}
+
+
+def apply_volume_changes(tickers: list[Ticker]) -> None:
+    for ticker in tickers:
+        if not ticker.ok or ticker.base_volume is None:
+            continue
+        fetcher = VOLUME_HISTORY_FETCHERS.get(ticker.exchange)
+        if not fetcher:
+            continue
+        try:
+            previous_volume = fetcher()
+            if previous_volume:
+                ticker.volume_change_pct = ((ticker.base_volume - previous_volume) / previous_volume) * 100
+        except Exception as exc:
+            ticker.error = ticker.error or f"volume change: {str(exc)[:80]}"
+
+
 def fetch_gate_candles(currency_pair: str = "KAS_USDT", hours: int = 24, interval: str = "5m") -> list[Candle]:
     limit = min(max(hours * 12, 1), 1000)
     payload = http_json(
@@ -329,6 +412,7 @@ def fetch_tickers() -> list[Ticker]:
                     error=str(exc)[:120],
                 )
             )
+    apply_volume_changes(tickers)
     return tickers
 
 
@@ -427,14 +511,28 @@ def market_volume(ticker: Ticker) -> str:
     return compact_volume(ticker.base_volume)
 
 
+def volume_change_value(ticker: Ticker) -> str:
+    if ticker.volume_change_pct is None:
+        return "-"
+    return f"{ticker.volume_change_pct:+.1f}%"
+
+
+def volume_change_color(ticker: Ticker) -> str:
+    if ticker.volume_change_pct is None:
+        return "#9aa4b2"
+    if ticker.volume_change_pct >= 0:
+        return "#37d67a"
+    return "#ff6b6b"
+
+
 def caption_volume(ticker: Ticker) -> str:
     if not ticker.ok or ticker.base_volume is None:
         return "-"
     return compact_volume(ticker.base_volume)
 
 
-def caption_row(exchange: str, price: str, volume: str) -> str:
-    return f"{exchange[:7]:<7} {price:>6} {volume:>8}"
+def caption_row(exchange: str, price: str, volume: str, change: str) -> str:
+    return f"{exchange[:7]:<7} {price:>6} {volume:>8} {change:>7}"
 
 
 def render_caption(tickers: list[Ticker], hashrate_ths: float | None = None) -> str:
@@ -453,16 +551,18 @@ def render_caption(tickers: list[Ticker], hashrate_ths: float | None = None) -> 
         lines.append(f"해시레이트: <b>{fmt_hashrate(hashrate_ths)}</b>")
 
     lines.append("")
-    lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'Volume'))}</code>")
+    lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'Volume', '24h'))}</code>")
     total_volume = 0.0
     for ticker in market_tickers(tickers):
         if not ticker.ok:
-            lines.append(f"<code>{html.escape(caption_row(ticker.exchange, 'error', '-'))}</code>")
+            lines.append(f"<code>{html.escape(caption_row(ticker.exchange, 'error', '-', '-'))}</code>")
             continue
         if ticker.base_volume is not None:
             total_volume += ticker.base_volume
-        lines.append(f"<code>{html.escape(caption_row(ticker.exchange, market_price(ticker), caption_volume(ticker)))}</code>")
-    lines.append(f"<code>{html.escape(caption_row('Total', '', compact_volume(total_volume)))}</code>")
+        lines.append(
+            f"<code>{html.escape(caption_row(ticker.exchange, market_price(ticker), caption_volume(ticker), volume_change_value(ticker)))}</code>"
+        )
+    lines.append(f"<code>{html.escape(caption_row('Total', '', compact_volume(total_volume), ''))}</code>")
 
     return "\n".join(lines)
 
@@ -629,10 +729,12 @@ def render_chart(
     header_y = 640
     exchange_x = 84
     price_right_x = 660
-    volume_right_x = 1516
+    volume_right_x = 1365
+    change_right_x = 1516
     draw.text((exchange_x, header_y), "Exchange", fill="#9aa4b2", font=small_font)
     draw_right(price_right_x, header_y, "Price", "#9aa4b2", small_font)
     draw_right(volume_right_x, header_y, "Volume", "#9aa4b2", small_font)
+    draw_right(change_right_x, header_y, "24h", "#9aa4b2", small_font)
     draw.line((84, header_y + 32, 1516, header_y + 32), fill="#2b3342", width=1)
 
     y = 678
@@ -647,6 +749,7 @@ def render_chart(
         draw.text((exchange_x, y + 3), ticker.exchange, fill=color, font=row_font)
         draw_right(price_right_x, y + 3, market_price(ticker), "#f3f6fb", row_font)
         draw_right(volume_right_x, y + 3, market_volume(ticker), "#f3f6fb", row_font)
+        draw_right(change_right_x, y + 3, volume_change_value(ticker), volume_change_color(ticker), row_font)
         y += 31
 
     draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
