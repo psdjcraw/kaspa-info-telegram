@@ -50,6 +50,12 @@ class Candle:
     volume: float
 
 
+@dataclass
+class HashratePoint:
+    ts: int
+    ths: float
+
+
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -76,7 +82,13 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 def http_json(url: str, timeout: float = 8.0) -> Any:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "kaspa-info-telegram/1.0",
+        },
+    )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -245,6 +257,31 @@ def fetch_gate_candles(hours: int = 24, interval: str = "5m") -> list[Candle]:
     return sorted(candles, key=lambda candle: candle.ts)
 
 
+def fetch_hashrate() -> float | None:
+    payload = http_json("https://api.kaspa.org/info/hashrate")
+    return as_float(payload.get("hashrate"))
+
+
+def fetch_hashrate_history(hours: int = 24) -> list[HashratePoint]:
+    now = datetime.now(timezone.utc)
+    days = [(now - timedelta(days=1)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")]
+    points: list[HashratePoint] = []
+    for day in days:
+        payload = http_json(f"https://api.kaspa.org/info/hashrate/history/{day}?resolution=15m")
+        for row in payload:
+            hashrate_kh = as_float(row.get("hashrate_kh"))
+            timestamp_ms = row.get("timestamp")
+            if hashrate_kh is None or timestamp_ms is None:
+                continue
+            points.append(HashratePoint(ts=int(int(timestamp_ms) / 1000), ths=hashrate_kh / 1_000_000_000))
+
+    if not points:
+        return []
+    latest_ts = max(point.ts for point in points)
+    cutoff = latest_ts - hours * 60 * 60
+    return sorted((point for point in points if point.ts >= cutoff), key=lambda point: point.ts)
+
+
 def fetch_tickers() -> list[Ticker]:
     tickers: list[Ticker] = []
     for fetcher in FETCHERS:
@@ -327,6 +364,16 @@ def compact_volume(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def fmt_hashrate(ths: float | None) -> str:
+    if ths is None:
+        return "-"
+    if ths >= 1_000_000:
+        return f"{ths / 1_000_000:.2f} EH/s"
+    if ths >= 1_000:
+        return f"{ths / 1_000:.2f} PH/s"
+    return f"{ths:.2f} TH/s"
+
+
 def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
     return sorted(
         [ticker for ticker in tickers if ticker.exchange != "Coinone"],
@@ -357,7 +404,7 @@ def caption_row(exchange: str, price: str, volume: str) -> str:
     return f"{exchange[:7]:<7} {price:>6} {volume:>8}"
 
 
-def render_caption(tickers: list[Ticker]) -> str:
+def render_caption(tickers: list[Ticker], hashrate_ths: float | None = None) -> str:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
     usd_prices = [ticker.last for ticker in ok_tickers if ticker.unit in {"USDT", "USD"}]
@@ -369,6 +416,8 @@ def render_caption(tickers: list[Ticker]) -> str:
         lines.append(f"평균: <b>{avg_usdt:.6f} USDT</b>")
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
+    if hashrate_ths is not None:
+        lines.append(f"해시레이트: <b>{fmt_hashrate(hashrate_ths)}</b>")
 
     lines.append("")
     lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'Volume'))}</code>")
@@ -397,7 +446,12 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
     return ImageFont.load_default()
 
 
-def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
+def render_chart(
+    candles: list[Candle],
+    tickers: list[Ticker],
+    hashrate_points: list[HashratePoint] | None = None,
+    hashrate_ths: float | None = None,
+) -> bytes:
     width, height = 1600, 960
     image = Image.new("RGB", (width, height), "#10131a")
     draw = ImageDraw.Draw(image)
@@ -432,6 +486,8 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
         inner_right = chart_box[2] - 96
         step = (inner_right - inner_left) / max(len(candles), 1)
         candle_width = max(2, min(9, int(step * 0.68)))
+        candle_start_ts = candles[0].ts
+        candle_end_ts = candles[-1].ts
 
         for index, candle in enumerate(candles):
             x = inner_left + index * step + step / 2
@@ -446,6 +502,37 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
             if bottom - top < 2:
                 bottom = top + 2
             draw.rectangle((x - candle_width / 2, top, x + candle_width / 2, bottom), fill=color)
+
+        hashrate_points = hashrate_points or []
+        visible_hashrates = [
+            point
+            for point in hashrate_points
+            if candle_start_ts <= point.ts <= candle_end_ts and point.ths > 0
+        ]
+        if len(visible_hashrates) >= 2:
+            values = [point.ths for point in visible_hashrates]
+            min_hashrate, max_hashrate = min(values), max(values)
+            hash_padding = (max_hashrate - min_hashrate) * 0.12 or max_hashrate * 0.03 or 1
+            min_hashrate -= hash_padding
+            max_hashrate += hash_padding
+
+            def x_for_ts(ts: int) -> float:
+                span = max(candle_end_ts - candle_start_ts, 1)
+                return inner_left + ((ts - candle_start_ts) / span) * (inner_right - inner_left)
+
+            def hash_y_for(ths: float) -> float:
+                return chart_box[3] - 22 - ((ths - min_hashrate) / (max_hashrate - min_hashrate)) * (
+                    chart_box[3] - chart_box[1] - 44
+                )
+
+            line_points = [(x_for_ts(point.ts), hash_y_for(point.ths)) for point in visible_hashrates]
+            draw.line(line_points, fill="#ff304f", width=3, joint="curve")
+            draw.text(
+                (chart_box[2] - 430, chart_box[1] + 58),
+                f"Hashrate {fmt_hashrate(hashrate_ths or visible_hashrates[-1].ths)}",
+                fill="#ff7184",
+                font=small_font,
+            )
 
         last = candles[-1]
         label_indexes = [0, len(candles) // 4, len(candles) // 2, (len(candles) * 3) // 4, len(candles) - 1]
@@ -592,13 +679,20 @@ def run_once(dry_run: bool = False) -> None:
     state = load_state()
     tickers = fetch_tickers()
     history = update_history(state, tickers)
-    caption = render_caption(tickers)
+    hashrate_ths = None
+    hashrate_points: list[HashratePoint] = []
+    try:
+        hashrate_ths = fetch_hashrate()
+        hashrate_points = fetch_hashrate_history()
+    except Exception as exc:
+        print(f"hashrate fallback: {exc}")
+    caption = render_caption(tickers, hashrate_ths)
     try:
         candles = fetch_gate_candles()
     except Exception as exc:
         print(f"candle fallback: {exc}")
         candles = history_as_candles(history)
-    chart_png = render_chart(candles, tickers)
+    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths)
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
