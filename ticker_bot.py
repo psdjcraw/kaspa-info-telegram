@@ -111,7 +111,7 @@ def fetch_gate() -> Ticker:
     payload = http_json("https://api.gateio.ws/api/v4/spot/tickers?currency_pair=KAS_USDT")
     ticker = payload[0]
     return Ticker(
-        exchange="Gate.io",
+        exchange="Gate",
         pair="KAS/USDT",
         last=float(ticker["last"]),
         bid=as_float(ticker.get("highest_bid")),
@@ -151,7 +151,76 @@ def fetch_kucoin() -> Ticker:
     )
 
 
-FETCHERS: list[Callable[[], Ticker]] = [fetch_coinone, fetch_gate, fetch_mexc, fetch_kucoin]
+def fetch_bybit() -> Ticker:
+    payload = http_json("https://api.bybit.com/v5/market/tickers?category=spot&symbol=KASUSDT")
+    ticker = payload["result"]["list"][0]
+    return Ticker(
+        exchange="Bybit",
+        pair="KAS/USDT",
+        last=float(ticker["lastPrice"]),
+        bid=as_float(ticker.get("bid1Price")),
+        ask=as_float(ticker.get("ask1Price")),
+        base_volume=as_float(ticker.get("volume24h")),
+        quote_volume=as_float(ticker.get("turnover24h")),
+        unit="USDT",
+    )
+
+
+def fetch_bitget() -> Ticker:
+    payload = http_json("https://api.bitget.com/api/v2/spot/market/tickers?symbol=KASUSDT")
+    ticker = payload["data"][0]
+    return Ticker(
+        exchange="Bitget",
+        pair="KAS/USDT",
+        last=float(ticker["lastPr"]),
+        bid=as_float(ticker.get("bidPr")),
+        ask=as_float(ticker.get("askPr")),
+        base_volume=as_float(ticker.get("baseVolume")),
+        quote_volume=as_float(ticker.get("quoteVolume") or ticker.get("usdtVolume")),
+        unit="USDT",
+    )
+
+
+def fetch_kraken() -> Ticker:
+    payload = http_json("https://api.kraken.com/0/public/Ticker?pair=KASUSD")
+    ticker = payload["result"]["KASUSD"]
+    return Ticker(
+        exchange="Kraken",
+        pair="KAS/USD",
+        last=float(ticker["c"][0]),
+        bid=as_float(ticker["b"][0]),
+        ask=as_float(ticker["a"][0]),
+        base_volume=as_float(ticker["v"][1]),
+        quote_volume=None,
+        unit="USD",
+    )
+
+
+def fetch_htx() -> Ticker:
+    payload = http_json("https://api.huobi.pro/market/detail/merged?symbol=kasusdt")
+    ticker = payload["tick"]
+    return Ticker(
+        exchange="HTX",
+        pair="KAS/USDT",
+        last=float(ticker["close"]),
+        bid=as_float((ticker.get("bid") or [None])[0]),
+        ask=as_float((ticker.get("ask") or [None])[0]),
+        base_volume=as_float(ticker.get("amount")),
+        quote_volume=as_float(ticker.get("vol")),
+        unit="USDT",
+    )
+
+
+FETCHERS: list[Callable[[], Ticker]] = [
+    fetch_coinone,
+    fetch_gate,
+    fetch_mexc,
+    fetch_kucoin,
+    fetch_bybit,
+    fetch_bitget,
+    fetch_kraken,
+    fetch_htx,
+]
 
 
 def fetch_gate_candles(hours: int = 24, interval: str = "5m") -> list[Candle]:
@@ -211,7 +280,7 @@ def history_as_candles(history: list[dict[str, Any]]) -> list[Candle]:
 
 
 def update_history(state: dict[str, Any], tickers: list[Ticker], max_points: int = 288) -> list[dict[str, Any]]:
-    usd_prices = [ticker.last for ticker in tickers if ticker.ok and ticker.unit == "USDT" and ticker.last > 0]
+    usd_prices = [ticker.last for ticker in tickers if ticker.ok and ticker.unit in {"USDT", "USD"} and ticker.last > 0]
     if not usd_prices:
         return state.get("history", [])
 
@@ -258,10 +327,26 @@ def compact_volume(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
+    return [ticker for ticker in tickers if ticker.exchange != "Coinone"]
+
+
+def market_price(ticker: Ticker) -> str:
+    if not ticker.ok:
+        return "error"
+    return f"{ticker.last:.4f}"
+
+
+def market_volume(ticker: Ticker) -> str:
+    if not ticker.ok or ticker.base_volume is None:
+        return "-"
+    return f"{ticker.base_volume:,.0f}"
+
+
 def render_caption(tickers: list[Ticker]) -> str:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
-    usd_prices = [ticker.last for ticker in ok_tickers if ticker.unit == "USDT"]
+    usd_prices = [ticker.last for ticker in ok_tickers if ticker.unit in {"USDT", "USD"}]
     avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
     coinone = next((ticker for ticker in ok_tickers if ticker.exchange == "Coinone"), None)
 
@@ -271,32 +356,18 @@ def render_caption(tickers: list[Ticker]) -> str:
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
 
-    table = []
-    for ticker in tickers:
+    table = [f"{'Exchange':<8} {'Price':>8} {'Volume':>14}"]
+    total_volume = 0.0
+    for ticker in market_tickers(tickers):
         if not ticker.ok:
-            table.extend(
-                [
-                    f"{ticker.exchange[:10]}  KAS",
-                    "LAST  error",
-                    "VOL   - / SPRD -",
-                    "",
-                ]
-            )
+            table.append(f"{ticker.exchange[:8]:<8} {'error':>8} {'-':>14}")
             continue
-        spread = "-"
-        if ticker.bid and ticker.ask and ticker.bid > 0:
-            spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
-        unit = ticker.unit
-        table.extend(
-            [
-                f"{ticker.exchange[:10]}  {ticker.pair}",
-                f"LAST  {price_value(ticker)} {unit}",
-                f"VOL   {compact_volume(ticker.base_volume)} KAS / SPRD {spread}",
-                "",
-            ]
-        )
+        if ticker.base_volume is not None:
+            total_volume += ticker.base_volume
+        table.append(f"{ticker.exchange[:8]:<8} {market_price(ticker):>8} {market_volume(ticker):>14}")
+    table.append(f"{'Total':<8} {'':>8} {total_volume:>14,.0f}")
 
-    lines.append(f"<pre>{html.escape(chr(10).join(table).rstrip())}</pre>")
+    lines.append(f"<pre>{html.escape(chr(10).join(table))}</pre>")
 
     return "\n".join(lines)
 
@@ -326,7 +397,7 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
     draw.text((width - 500, 32), "24H / 5M CANDLES", fill="#9aa4b2", font=text_font)
     draw.text((width - 235, 72), datetime.now(KST).strftime("%H:%M:%S KST"), fill="#9aa4b2", font=small_font)
 
-    chart_box = (84, 142, 1516, 622)
+    chart_box = (84, 142, 1516, 590)
     draw.rounded_rectangle(chart_box, radius=12, fill="#0b0e13", outline="#2b3342", width=2)
 
     for index in range(1, 5):
@@ -378,25 +449,26 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
     else:
         draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
-    header_y = 690
+    header_y = 640
     draw.text((84, header_y), "Exchange", fill="#9aa4b2", font=small_font)
-    draw.text((320, header_y), "Pair", fill="#9aa4b2", font=small_font)
-    draw.text((550, header_y), "Last", fill="#9aa4b2", font=small_font)
-    draw.text((860, header_y), "Volume", fill="#9aa4b2", font=small_font)
-    draw.text((1160, header_y), "Spread", fill="#9aa4b2", font=small_font)
+    draw.text((460, header_y), "Price", fill="#9aa4b2", font=small_font)
+    draw.text((780, header_y), "Volume", fill="#9aa4b2", font=small_font)
 
-    y = 734
-    for ticker in tickers[:4]:
+    y = 678
+    total_volume = 0.0
+    row_font = load_font(27)
+    for ticker in market_tickers(tickers):
         color = "#37d67a" if ticker.ok else "#ff6b6b"
-        spread = "-"
-        if ticker.ok and ticker.bid and ticker.ask and ticker.bid > 0:
-            spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
-        draw.text((84, y), ticker.exchange, fill=color, font=text_font)
-        draw.text((320, y), ticker.pair, fill="#f3f6fb", font=text_font)
-        draw.text((550, y), fmt_price(ticker), fill="#f3f6fb", font=text_font)
-        draw.text((860, y), fmt_volume(ticker.base_volume, "KAS"), fill="#f3f6fb", font=text_font)
-        draw.text((1160, y), spread, fill="#f3f6fb", font=text_font)
-        y += 48
+        if ticker.ok and ticker.base_volume is not None:
+            total_volume += ticker.base_volume
+        draw.text((84, y + 3), ticker.exchange, fill=color, font=row_font)
+        draw.text((460, y + 3), market_price(ticker), fill="#f3f6fb", font=row_font)
+        draw.text((780, y + 3), market_volume(ticker), fill="#f3f6fb", font=row_font)
+        y += 31
+
+    draw.line((84, y + 2, 1190, y + 2), fill="#2b3342", width=1)
+    draw.text((84, y + 8), "Total", fill="#9aa4b2", font=row_font)
+    draw.text((780, y + 8), f"{total_volume:,.0f}", fill="#f3f6fb", font=row_font)
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)

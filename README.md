@@ -13,9 +13,13 @@
 현재 수집 거래소:
 
 - Coinone `KAS/KRW`
-- Gate.io `KAS/USDT`
+- Gate `KAS/USDT`
 - MEXC `KAS/USDT`
 - KuCoin `KAS/USDT`
+- Bybit `KAS/USDT`
+- Bitget `KAS/USDT`
+- Kraken `KAS/USD`
+- HTX `KAS/USDT`
 
 ## 준비
 
