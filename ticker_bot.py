@@ -424,7 +424,7 @@ def market_price(ticker: Ticker) -> str:
 def market_volume(ticker: Ticker) -> str:
     if not ticker.ok or ticker.base_volume is None:
         return "-"
-    return f"{ticker.base_volume:,.0f}"
+    return compact_volume(ticker.base_volume)
 
 
 def caption_volume(ticker: Ticker) -> str:
@@ -651,7 +651,7 @@ def render_chart(
 
     draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
     draw.text((exchange_x, y + 8), "Total", fill="#9aa4b2", font=row_font)
-    draw_right(volume_right_x, y + 8, f"{total_volume:,.0f}", "#f3f6fb", row_font)
+    draw_right(volume_right_x, y + 8, compact_volume(total_volume), "#f3f6fb", row_font)
 
     if IMAGE_SCALE != 1:
         image = image.resize((int(width * IMAGE_SCALE), int(height * IMAGE_SCALE)), Image.Resampling.LANCZOS)
