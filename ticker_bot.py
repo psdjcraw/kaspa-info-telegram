@@ -328,7 +328,11 @@ def compact_volume(value: float | None) -> str:
 
 
 def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
-    return [ticker for ticker in tickers if ticker.exchange != "Coinone"]
+    return sorted(
+        [ticker for ticker in tickers if ticker.exchange != "Coinone"],
+        key=lambda ticker: (ticker.ok, ticker.base_volume or 0),
+        reverse=True,
+    )
 
 
 def market_price(ticker: Ticker) -> str:
@@ -349,6 +353,10 @@ def caption_volume(ticker: Ticker) -> str:
     return compact_volume(ticker.base_volume)
 
 
+def caption_row(exchange: str, price: str, volume: str) -> str:
+    return f"{exchange[:7]:<7} {price:>6} {volume:>8}"
+
+
 def render_caption(tickers: list[Ticker]) -> str:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
@@ -363,16 +371,16 @@ def render_caption(tickers: list[Ticker]) -> str:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
 
     lines.append("")
-    lines.append("<b>Exchange · Price · Volume</b>")
+    lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'Volume'))}</code>")
     total_volume = 0.0
     for ticker in market_tickers(tickers):
         if not ticker.ok:
-            lines.append(f"{html.escape(ticker.exchange)} · error · -")
+            lines.append(f"<code>{html.escape(caption_row(ticker.exchange, 'error', '-'))}</code>")
             continue
         if ticker.base_volume is not None:
             total_volume += ticker.base_volume
-        lines.append(f"{html.escape(ticker.exchange)} · {market_price(ticker)} · {caption_volume(ticker)}")
-    lines.append(f"Total · {compact_volume(total_volume)}")
+        lines.append(f"<code>{html.escape(caption_row(ticker.exchange, market_price(ticker), caption_volume(ticker)))}</code>")
+    lines.append(f"<code>{html.escape(caption_row('Total', '', compact_volume(total_volume)))}</code>")
 
     return "\n".join(lines)
 
