@@ -25,7 +25,7 @@ case "${1:-status}" in
       echo "running pid=$(cat "$PID_FILE")"
       exit 0
     fi
-    nohup python3 ticker_bot.py >>"$LOG_FILE" 2>&1 &
+    PYTHONUNBUFFERED=1 nohup python3 ticker_bot.py >>"$LOG_FILE" 2>&1 &
     echo $! >"$PID_FILE"
     echo "started pid=$(cat "$PID_FILE")"
     ;;
