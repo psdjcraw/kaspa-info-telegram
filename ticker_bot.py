@@ -235,11 +235,11 @@ FETCHERS: list[Callable[[], Ticker]] = [
 ]
 
 
-def fetch_gate_candles(hours: int = 24, interval: str = "5m") -> list[Candle]:
+def fetch_gate_candles(currency_pair: str = "KAS_USDT", hours: int = 24, interval: str = "5m") -> list[Candle]:
     limit = min(max(hours * 12, 1), 1000)
     payload = http_json(
         "https://api.gateio.ws/api/v4/spot/candlesticks?"
-        f"currency_pair=KAS_USDT&interval={interval}&limit={limit}"
+        f"currency_pair={urllib.parse.quote(currency_pair)}&interval={interval}&limit={limit}"
     )
     candles: list[Candle] = []
     for row in payload:
@@ -374,6 +374,12 @@ def fmt_hashrate(ths: float | None) -> str:
     return f"{ths:.2f} TH/s"
 
 
+def fmt_btc_price(price: float | None) -> str:
+    if price is None:
+        return "-"
+    return f"{price:,.0f} USDT"
+
+
 def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
     return sorted(
         [ticker for ticker in tickers if ticker.exchange != "Coinone"],
@@ -451,6 +457,7 @@ def render_chart(
     tickers: list[Ticker],
     hashrate_points: list[HashratePoint] | None = None,
     hashrate_ths: float | None = None,
+    btc_candles: list[Candle] | None = None,
 ) -> bytes:
     width, height = 1600, 960
     image = Image.new("RGB", (width, height), "#10131a")
@@ -489,6 +496,24 @@ def render_chart(
         candle_start_ts = candles[0].ts
         candle_end_ts = candles[-1].ts
 
+        def x_for_ts(ts: int) -> float:
+            span = max(candle_end_ts - candle_start_ts, 1)
+            return inner_left + ((ts - candle_start_ts) / span) * (inner_right - inner_left)
+
+        def scaled_line_points(points: list[tuple[int, float]]) -> list[tuple[float, float]]:
+            values = [value for _, value in points]
+            min_value, max_value = min(values), max(values)
+            value_padding = (max_value - min_value) * 0.12 or max_value * 0.03 or 1
+            min_value -= value_padding
+            max_value += value_padding
+
+            def line_y_for(value: float) -> float:
+                return chart_box[3] - 22 - ((value - min_value) / (max_value - min_value)) * (
+                    chart_box[3] - chart_box[1] - 44
+                )
+
+            return [(x_for_ts(ts), line_y_for(value)) for ts, value in points]
+
         for index, candle in enumerate(candles):
             x = inner_left + index * step + step / 2
             open_y = y_for(candle.open)
@@ -510,27 +535,28 @@ def render_chart(
             if candle_start_ts <= point.ts <= candle_end_ts and point.ths > 0
         ]
         if len(visible_hashrates) >= 2:
-            values = [point.ths for point in visible_hashrates]
-            min_hashrate, max_hashrate = min(values), max(values)
-            hash_padding = (max_hashrate - min_hashrate) * 0.12 or max_hashrate * 0.03 or 1
-            min_hashrate -= hash_padding
-            max_hashrate += hash_padding
-
-            def x_for_ts(ts: int) -> float:
-                span = max(candle_end_ts - candle_start_ts, 1)
-                return inner_left + ((ts - candle_start_ts) / span) * (inner_right - inner_left)
-
-            def hash_y_for(ths: float) -> float:
-                return chart_box[3] - 22 - ((ths - min_hashrate) / (max_hashrate - min_hashrate)) * (
-                    chart_box[3] - chart_box[1] - 44
-                )
-
-            line_points = [(x_for_ts(point.ts), hash_y_for(point.ths)) for point in visible_hashrates]
+            line_points = scaled_line_points([(point.ts, point.ths) for point in visible_hashrates])
             draw.line(line_points, fill="#ff304f", width=3, joint="curve")
             draw.text(
                 (chart_box[2] - 430, chart_box[1] + 58),
                 f"Hashrate {fmt_hashrate(hashrate_ths or visible_hashrates[-1].ths)}",
                 fill="#ff7184",
+                font=small_font,
+            )
+
+        btc_candles = btc_candles or []
+        visible_btc = [
+            candle
+            for candle in btc_candles
+            if candle_start_ts <= candle.ts <= candle_end_ts and candle.close > 0
+        ]
+        if len(visible_btc) >= 2:
+            line_points = scaled_line_points([(candle.ts, candle.close) for candle in visible_btc])
+            draw.line(line_points, fill="#42a5ff", width=3, joint="curve")
+            draw.text(
+                (chart_box[2] - 430, chart_box[1] + 86),
+                f"BTC {fmt_btc_price(visible_btc[-1].close)}",
+                fill="#78bdff",
                 font=small_font,
             )
 
@@ -692,7 +718,12 @@ def run_once(dry_run: bool = False) -> None:
     except Exception as exc:
         print(f"candle fallback: {exc}")
         candles = history_as_candles(history)
-    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths)
+    btc_candles: list[Candle] = []
+    try:
+        btc_candles = fetch_gate_candles("BTC_USDT")
+    except Exception as exc:
+        print(f"btc fallback: {exc}")
+    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths, btc_candles)
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
