@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import io
 import json
 import os
@@ -37,6 +38,16 @@ class Ticker:
     unit: str
     ok: bool = True
     error: str = ""
+
+
+@dataclass
+class Candle:
+    ts: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
 def env(name: str, default: str = "") -> str:
@@ -143,6 +154,28 @@ def fetch_kucoin() -> Ticker:
 FETCHERS: list[Callable[[], Ticker]] = [fetch_coinone, fetch_gate, fetch_mexc, fetch_kucoin]
 
 
+def fetch_gate_candles(hours: int = 24, interval: str = "5m") -> list[Candle]:
+    limit = min(max(hours * 12, 1), 1000)
+    payload = http_json(
+        "https://api.gateio.ws/api/v4/spot/candlesticks?"
+        f"currency_pair=KAS_USDT&interval={interval}&limit={limit}"
+    )
+    candles: list[Candle] = []
+    for row in payload:
+        # Gate: [timestamp, quote_volume, close, high, low, open, base_volume, finished]
+        candles.append(
+            Candle(
+                ts=int(row[0]),
+                open=float(row[5]),
+                high=float(row[3]),
+                low=float(row[4]),
+                close=float(row[2]),
+                volume=float(row[6]),
+            )
+        )
+    return sorted(candles, key=lambda candle: candle.ts)
+
+
 def fetch_tickers() -> list[Ticker]:
     tickers: list[Ticker] = []
     for fetcher in FETCHERS:
@@ -166,6 +199,17 @@ def fetch_tickers() -> list[Ticker]:
     return tickers
 
 
+def history_as_candles(history: list[dict[str, Any]]) -> list[Candle]:
+    candles: list[Candle] = []
+    for point in history:
+        price = as_float(point.get("price"))
+        ts = point.get("ts")
+        if price is None or ts is None:
+            continue
+        candles.append(Candle(ts=int(ts), open=price, high=price, low=price, close=price, volume=0))
+    return candles
+
+
 def update_history(state: dict[str, Any], tickers: list[Ticker], max_points: int = 288) -> list[dict[str, Any]]:
     usd_prices = [ticker.last for ticker in tickers if ticker.ok and ticker.unit == "USDT" and ticker.last > 0]
     if not usd_prices:
@@ -184,6 +228,14 @@ def fmt_price(ticker: Ticker) -> str:
     if ticker.unit == "KRW":
         return f"{ticker.last:,.2f} KRW"
     return f"{ticker.last:.6f} USDT"
+
+
+def price_value(ticker: Ticker) -> str:
+    if not ticker.ok:
+        return "error"
+    if ticker.unit == "KRW":
+        return f"{ticker.last:,.2f}"
+    return f"{ticker.last:.6f}"
 
 
 def fmt_volume(value: float | None, unit: str) -> str:
@@ -208,21 +260,24 @@ def render_caption(tickers: list[Ticker]) -> str:
         lines.append(f"평균: <b>{avg_usdt:.6f} USDT</b>")
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
-    lines.append("")
 
+    table = ["EXCHANGE  PAIR      LAST        VOL(KAS)   SPRD"]
     for ticker in tickers:
         if not ticker.ok:
-            lines.append(f"• {ticker.exchange}: <code>error</code>")
+            table.append(f"{ticker.exchange[:8]:<8}  {'KAS':<8}  {'error':>10}  {'-':>9}  {'-':>5}")
             continue
-        spread = ""
+        spread = "-"
         if ticker.bid and ticker.ask and ticker.bid > 0:
-            spread = f" / spread {(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
-        lines.append(
-            "• "
-            f"<b>{ticker.exchange}</b> {fmt_price(ticker)}"
-            f" / vol {fmt_volume(ticker.base_volume, 'KAS')}"
-            f"{spread}"
+            spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
+        table.append(
+            f"{ticker.exchange[:8]:<8}  "
+            f"{ticker.pair:<8}  "
+            f"{price_value(ticker):>10}  "
+            f"{fmt_volume(ticker.base_volume, '').strip():>9}  "
+            f"{spread:>5}"
         )
+
+    lines.append(f"<pre>{html.escape(chr(10).join(table))}</pre>")
 
     return "\n".join(lines)
 
@@ -239,48 +294,82 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
     return ImageFont.load_default()
 
 
-def render_chart(history: list[dict[str, Any]], tickers: list[Ticker]) -> bytes:
-    width, height = 960, 540
+def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
+    width, height = 1280, 720
     image = Image.new("RGB", (width, height), "#10131a")
     draw = ImageDraw.Draw(image)
-    title_font = load_font(34, bold=True)
-    text_font = load_font(22)
-    small_font = load_font(18)
+    title_font = load_font(42, bold=True)
+    text_font = load_font(25)
+    small_font = load_font(20)
 
-    draw.rectangle((0, 0, width, 84), fill="#171b24")
-    draw.text((32, 24), "KASPA LIVE TICKER", fill="#f3f6fb", font=title_font)
-    draw.text((width - 270, 30), datetime.now(KST).strftime("%H:%M:%S KST"), fill="#9aa4b2", font=text_font)
+    draw.rectangle((0, 0, width, 96), fill="#171b24")
+    draw.text((38, 24), "KASPA LIVE TICKER", fill="#f3f6fb", font=title_font)
+    draw.text((width - 390, 28), "24H / 5M CANDLES", fill="#9aa4b2", font=text_font)
+    draw.text((width - 190, 58), datetime.now(KST).strftime("%H:%M:%S"), fill="#9aa4b2", font=small_font)
 
-    chart_box = (54, 116, 912, 378)
+    chart_box = (70, 128, 1206, 492)
     draw.rounded_rectangle(chart_box, radius=12, fill="#0b0e13", outline="#2b3342", width=2)
-    draw.line((chart_box[0], chart_box[3], chart_box[2], chart_box[3]), fill="#3d4658", width=1)
 
-    prices = [float(point["price"]) for point in history if point.get("price")]
-    if len(prices) >= 2:
-        min_price, max_price = min(prices), max(prices)
-        if min_price == max_price:
-            min_price -= 0.0001
-            max_price += 0.0001
-        points = []
-        for index, price in enumerate(prices):
-            x = chart_box[0] + 18 + index * ((chart_box[2] - chart_box[0] - 36) / max(len(prices) - 1, 1))
-            y = chart_box[3] - 20 - ((price - min_price) / (max_price - min_price)) * (chart_box[3] - chart_box[1] - 40)
-            points.append((x, y))
-        draw.line(points, fill="#37d67a", width=4)
-        for point in points[-4:]:
-            draw.ellipse((point[0] - 4, point[1] - 4, point[0] + 4, point[1] + 4), fill="#f4d35e")
-        draw.text((chart_box[0] + 20, chart_box[1] + 16), f"High {max_price:.6f}", fill="#9aa4b2", font=small_font)
-        draw.text((chart_box[0] + 20, chart_box[3] - 38), f"Low {min_price:.6f}", fill="#9aa4b2", font=small_font)
+    for index in range(1, 5):
+        y = chart_box[1] + index * ((chart_box[3] - chart_box[1]) / 5)
+        draw.line((chart_box[0] + 1, y, chart_box[2] - 1, y), fill="#1d2532", width=1)
+
+    if len(candles) >= 2:
+        lows = [candle.low for candle in candles]
+        highs = [candle.high for candle in candles]
+        min_price, max_price = min(lows), max(highs)
+        padding = (max_price - min_price) * 0.08 or 0.0001
+        min_price -= padding
+        max_price += padding
+
+        def y_for(price: float) -> float:
+            return chart_box[3] - 22 - ((price - min_price) / (max_price - min_price)) * (chart_box[3] - chart_box[1] - 44)
+
+        inner_left = chart_box[0] + 24
+        inner_right = chart_box[2] - 80
+        step = (inner_right - inner_left) / max(len(candles), 1)
+        candle_width = max(2, min(8, int(step * 0.65)))
+
+        for index, candle in enumerate(candles):
+            x = inner_left + index * step + step / 2
+            open_y = y_for(candle.open)
+            close_y = y_for(candle.close)
+            high_y = y_for(candle.high)
+            low_y = y_for(candle.low)
+            up = candle.close >= candle.open
+            color = "#38d87c" if up else "#ff5c72"
+            draw.line((x, high_y, x, low_y), fill=color, width=1)
+            top, bottom = min(open_y, close_y), max(open_y, close_y)
+            if bottom - top < 2:
+                bottom = top + 2
+            draw.rectangle((x - candle_width / 2, top, x + candle_width / 2, bottom), fill=color)
+
+        last = candles[-1]
+        draw.text((chart_box[0] + 24, chart_box[1] + 16), f"High {max(highs):.6f}", fill="#9aa4b2", font=small_font)
+        draw.text((chart_box[0] + 24, chart_box[3] - 42), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
+        draw.text((chart_box[2] - 250, chart_box[1] + 16), f"Last {last.close:.6f} USDT", fill="#f3f6fb", font=text_font)
     else:
-        draw.text((chart_box[0] + 250, chart_box[1] + 110), "collecting chart history...", fill="#9aa4b2", font=text_font)
+        draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
-    y = 408
+    header_y = 530
+    draw.text((70, header_y), "Exchange", fill="#9aa4b2", font=small_font)
+    draw.text((250, header_y), "Pair", fill="#9aa4b2", font=small_font)
+    draw.text((430, header_y), "Last", fill="#9aa4b2", font=small_font)
+    draw.text((650, header_y), "Volume", fill="#9aa4b2", font=small_font)
+    draw.text((880, header_y), "Spread", fill="#9aa4b2", font=small_font)
+
+    y = 566
     for ticker in tickers[:4]:
         color = "#37d67a" if ticker.ok else "#ff6b6b"
-        draw.text((54, y), ticker.exchange, fill=color, font=text_font)
-        draw.text((190, y), fmt_price(ticker), fill="#f3f6fb", font=text_font)
-        draw.text((430, y), f"vol {fmt_volume(ticker.base_volume, 'KAS')}", fill="#9aa4b2", font=text_font)
-        y += 34
+        spread = "-"
+        if ticker.ok and ticker.bid and ticker.ask and ticker.bid > 0:
+            spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
+        draw.text((70, y), ticker.exchange, fill=color, font=text_font)
+        draw.text((250, y), ticker.pair, fill="#f3f6fb", font=text_font)
+        draw.text((430, y), fmt_price(ticker), fill="#f3f6fb", font=text_font)
+        draw.text((650, y), fmt_volume(ticker.base_volume, "KAS"), fill="#f3f6fb", font=text_font)
+        draw.text((880, y), spread, fill="#f3f6fb", font=text_font)
+        y += 40
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
@@ -382,7 +471,12 @@ def run_once(dry_run: bool = False) -> None:
     tickers = fetch_tickers()
     history = update_history(state, tickers)
     caption = render_caption(tickers)
-    chart_png = render_chart(history, tickers)
+    try:
+        candles = fetch_gate_candles()
+    except Exception as exc:
+        print(f"candle fallback: {exc}")
+        candles = history_as_candles(history)
+    chart_png = render_chart(candles, tickers)
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
