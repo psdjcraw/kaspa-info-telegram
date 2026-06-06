@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -40,6 +41,13 @@ class Ticker:
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def telegram_chat_id() -> str:
+    chat_id = env("TELEGRAM_CHAT_ID")
+    if chat_id.isdigit() and len(chat_id) >= 10:
+        return f"-100{chat_id}"
+    return chat_id
 
 
 def load_state() -> dict[str, Any]:
@@ -309,15 +317,36 @@ def telegram_api(method: str, fields: dict[str, Any], files: dict[str, tuple[str
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         )
 
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body)
+            description = payload.get("description", body)
+        except json.JSONDecodeError:
+            description = body
+        raise RuntimeError(f"Telegram {method} failed: {description}") from exc
     if not payload.get("ok"):
         raise RuntimeError(payload)
     return payload["result"]
 
 
+def check_telegram_config() -> None:
+    bot = telegram_api("getMe", {})
+    print(f"bot: @{bot.get('username')} id={bot.get('id')}")
+
+    chat_id = telegram_chat_id()
+    if not chat_id:
+        raise RuntimeError("TELEGRAM_CHAT_ID is not set")
+
+    chat = telegram_api("getChat", {"chat_id": chat_id})
+    print(f"chat: {chat.get('type')} {chat.get('title') or chat.get('username') or chat.get('id')}")
+
+
 def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) -> None:
-    chat_id = env("TELEGRAM_CHAT_ID")
+    chat_id = telegram_chat_id()
     if not chat_id:
         raise RuntimeError("TELEGRAM_CHAT_ID is not set")
 
@@ -393,8 +422,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Kaspa Telegram live ticker")
     parser.add_argument("--once", action="store_true", help="run one update and exit")
     parser.add_argument("--dry-run", action="store_true", help="render locally without Telegram API calls")
+    parser.add_argument("--check-telegram", action="store_true", help="validate bot token and chat access")
     parser.add_argument("--interval", type=int, default=int(env("TICKER_INTERVAL_SECONDS", "5")))
     args = parser.parse_args()
+
+    if args.check_telegram:
+        try:
+            check_telegram_config()
+        except RuntimeError as exc:
+            print(f"error: {exc}")
+            sys.exit(1)
+        return
 
     if args.once:
         run_once(dry_run=args.dry_run)

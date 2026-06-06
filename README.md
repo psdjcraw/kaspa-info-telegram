@@ -33,6 +33,8 @@ export TICKER_INTERVAL_SECONDS=5
 ```
 
 채널에 올리려면 봇을 채널 admin으로 추가하고 메시지 게시 권한을 줘야 합니다.
+BotFather나 다른 도구에서 `3610763757`처럼 양수 채널 ID만 받은 경우에는 그대로 넣어도 됩니다.
+봇은 Telegram Bot API용 `-1003610763757` 형태로 자동 보정합니다.
 
 ## 테스트
 
@@ -40,6 +42,12 @@ Telegram에 보내지 않고 로컬 차트만 생성:
 
 ```bash
 python3 ticker_bot.py --once --dry-run
+```
+
+봇 토큰과 채널 접근권한 확인:
+
+```bash
+python3 ticker_bot.py --check-telegram
 ```
 
 실제 Telegram 메시지 1회 생성/수정:
