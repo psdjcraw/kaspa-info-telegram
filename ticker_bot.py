@@ -261,20 +261,20 @@ def render_caption(tickers: list[Ticker]) -> str:
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
 
-    table = ["EXCHANGE  PAIR      LAST        VOL(KAS)   SPRD"]
+    table = ["EXCHANGE    PAIR        LAST          VOL(KAS)      SPRD"]
     for ticker in tickers:
         if not ticker.ok:
-            table.append(f"{ticker.exchange[:8]:<8}  {'KAS':<8}  {'error':>10}  {'-':>9}  {'-':>5}")
+            table.append(f"{ticker.exchange[:10]:<10}  {'KAS':<10}  {'error':>12}  {'-':>12}  {'-':>6}")
             continue
         spread = "-"
         if ticker.bid and ticker.ask and ticker.bid > 0:
             spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
         table.append(
-            f"{ticker.exchange[:8]:<8}  "
-            f"{ticker.pair:<8}  "
-            f"{price_value(ticker):>10}  "
-            f"{fmt_volume(ticker.base_volume, '').strip():>9}  "
-            f"{spread:>5}"
+            f"{ticker.exchange[:10]:<10}  "
+            f"{ticker.pair:<10}  "
+            f"{price_value(ticker):>12}  "
+            f"{fmt_volume(ticker.base_volume, '').strip():>12}  "
+            f"{spread:>6}"
         )
 
     lines.append(f"<pre>{html.escape(chr(10).join(table))}</pre>")
@@ -295,19 +295,19 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFo
 
 
 def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
-    width, height = 1280, 720
+    width, height = 1600, 960
     image = Image.new("RGB", (width, height), "#10131a")
     draw = ImageDraw.Draw(image)
-    title_font = load_font(42, bold=True)
-    text_font = load_font(25)
-    small_font = load_font(20)
+    title_font = load_font(50, bold=True)
+    text_font = load_font(31)
+    small_font = load_font(23)
 
-    draw.rectangle((0, 0, width, 96), fill="#171b24")
-    draw.text((38, 24), "KASPA LIVE TICKER", fill="#f3f6fb", font=title_font)
-    draw.text((width - 390, 28), "24H / 5M CANDLES", fill="#9aa4b2", font=text_font)
-    draw.text((width - 190, 58), datetime.now(KST).strftime("%H:%M:%S"), fill="#9aa4b2", font=small_font)
+    draw.rectangle((0, 0, width, 110), fill="#171b24")
+    draw.text((48, 28), "KASPA LIVE TICKER", fill="#f3f6fb", font=title_font)
+    draw.text((width - 500, 32), "24H / 5M CANDLES", fill="#9aa4b2", font=text_font)
+    draw.text((width - 235, 72), datetime.now(KST).strftime("%H:%M:%S KST"), fill="#9aa4b2", font=small_font)
 
-    chart_box = (70, 128, 1206, 492)
+    chart_box = (84, 142, 1516, 622)
     draw.rounded_rectangle(chart_box, radius=12, fill="#0b0e13", outline="#2b3342", width=2)
 
     for index in range(1, 5):
@@ -325,10 +325,10 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
         def y_for(price: float) -> float:
             return chart_box[3] - 22 - ((price - min_price) / (max_price - min_price)) * (chart_box[3] - chart_box[1] - 44)
 
-        inner_left = chart_box[0] + 24
-        inner_right = chart_box[2] - 80
+        inner_left = chart_box[0] + 30
+        inner_right = chart_box[2] - 96
         step = (inner_right - inner_left) / max(len(candles), 1)
-        candle_width = max(2, min(8, int(step * 0.65)))
+        candle_width = max(2, min(9, int(step * 0.68)))
 
         for index, candle in enumerate(candles):
             x = inner_left + index * step + step / 2
@@ -345,31 +345,39 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
             draw.rectangle((x - candle_width / 2, top, x + candle_width / 2, bottom), fill=color)
 
         last = candles[-1]
-        draw.text((chart_box[0] + 24, chart_box[1] + 16), f"High {max(highs):.6f}", fill="#9aa4b2", font=small_font)
-        draw.text((chart_box[0] + 24, chart_box[3] - 42), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
-        draw.text((chart_box[2] - 250, chart_box[1] + 16), f"Last {last.close:.6f} USDT", fill="#f3f6fb", font=text_font)
+        label_indexes = [0, len(candles) // 4, len(candles) // 2, (len(candles) * 3) // 4, len(candles) - 1]
+        for label_index in label_indexes:
+            candle = candles[label_index]
+            x = inner_left + label_index * step + step / 2
+            draw.line((x, chart_box[1] + 1, x, chart_box[3] - 1), fill="#182030", width=1)
+            label = datetime.fromtimestamp(candle.ts, tz=KST).strftime("%H:%M")
+            draw.text((x - 34, chart_box[3] + 16), label, fill="#9aa4b2", font=small_font)
+
+        draw.text((chart_box[0] + 28, chart_box[1] + 18), f"High {max(highs):.6f}", fill="#9aa4b2", font=small_font)
+        draw.text((chart_box[0] + 28, chart_box[3] - 48), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
+        draw.text((chart_box[2] - 330, chart_box[1] + 18), f"Last {last.close:.6f} USDT", fill="#f3f6fb", font=text_font)
     else:
         draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
-    header_y = 530
-    draw.text((70, header_y), "Exchange", fill="#9aa4b2", font=small_font)
-    draw.text((250, header_y), "Pair", fill="#9aa4b2", font=small_font)
-    draw.text((430, header_y), "Last", fill="#9aa4b2", font=small_font)
-    draw.text((650, header_y), "Volume", fill="#9aa4b2", font=small_font)
-    draw.text((880, header_y), "Spread", fill="#9aa4b2", font=small_font)
+    header_y = 690
+    draw.text((84, header_y), "Exchange", fill="#9aa4b2", font=small_font)
+    draw.text((320, header_y), "Pair", fill="#9aa4b2", font=small_font)
+    draw.text((550, header_y), "Last", fill="#9aa4b2", font=small_font)
+    draw.text((860, header_y), "Volume", fill="#9aa4b2", font=small_font)
+    draw.text((1160, header_y), "Spread", fill="#9aa4b2", font=small_font)
 
-    y = 566
+    y = 734
     for ticker in tickers[:4]:
         color = "#37d67a" if ticker.ok else "#ff6b6b"
         spread = "-"
         if ticker.ok and ticker.bid and ticker.ask and ticker.bid > 0:
             spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
-        draw.text((70, y), ticker.exchange, fill=color, font=text_font)
-        draw.text((250, y), ticker.pair, fill="#f3f6fb", font=text_font)
-        draw.text((430, y), fmt_price(ticker), fill="#f3f6fb", font=text_font)
-        draw.text((650, y), fmt_volume(ticker.base_volume, "KAS"), fill="#f3f6fb", font=text_font)
-        draw.text((880, y), spread, fill="#f3f6fb", font=text_font)
-        y += 40
+        draw.text((84, y), ticker.exchange, fill=color, font=text_font)
+        draw.text((320, y), ticker.pair, fill="#f3f6fb", font=text_font)
+        draw.text((550, y), fmt_price(ticker), fill="#f3f6fb", font=text_font)
+        draw.text((860, y), fmt_volume(ticker.base_volume, "KAS"), fill="#f3f6fb", font=text_font)
+        draw.text((1160, y), spread, fill="#f3f6fb", font=text_font)
+        y += 48
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
@@ -519,7 +527,7 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="run one update and exit")
     parser.add_argument("--dry-run", action="store_true", help="render locally without Telegram API calls")
     parser.add_argument("--check-telegram", action="store_true", help="validate bot token and chat access")
-    parser.add_argument("--interval", type=int, default=int(env("TICKER_INTERVAL_SECONDS", "5")))
+    parser.add_argument("--interval", type=int, default=int(env("TICKER_INTERVAL_SECONDS", "60")))
     args = parser.parse_args()
 
     if args.check_telegram:

@@ -29,7 +29,7 @@ python3 -m pip install -r requirements.txt
 ```bash
 export TELEGRAM_BOT_TOKEN="123456:..."
 export TELEGRAM_CHAT_ID="@your_channel_or_chat_id"
-export TICKER_INTERVAL_SECONDS=5
+export TICKER_INTERVAL_SECONDS=60
 ```
 
 채널에 올리려면 봇을 채널 admin으로 추가하고 메시지 게시 권한을 줘야 합니다.
@@ -56,7 +56,7 @@ python3 ticker_bot.py --check-telegram
 python3 ticker_bot.py --once
 ```
 
-5초 주기 반복:
+60초 주기 반복:
 
 ```bash
 python3 ticker_bot.py
