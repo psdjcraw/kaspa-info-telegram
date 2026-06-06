@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "state.json"
 CHART_PATH = ROOT / "kaspa-chart.png"
 KST = timezone(timedelta(hours=9))
+IMAGE_SCALE = 1.3
 
 
 @dataclass
@@ -605,6 +606,9 @@ def render_chart(
     draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
     draw.text((exchange_x, y + 8), "Total", fill="#9aa4b2", font=row_font)
     draw_right(volume_right_x, y + 8, f"{total_volume:,.0f}", "#f3f6fb", row_font)
+
+    if IMAGE_SCALE != 1:
+        image = image.resize((int(width * IMAGE_SCALE), int(height * IMAGE_SCALE)), Image.Resampling.LANCZOS)
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
