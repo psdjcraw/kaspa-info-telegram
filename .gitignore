@@ -1,6 +1,8 @@
 .env
 state.json
 kaspa-chart.png
+ticker.log
+ticker.pid
 __pycache__/
 *.pyc
 .DS_Store

@@ -62,6 +62,15 @@ python3 ticker_bot.py --once
 python3 ticker_bot.py
 ```
 
+백그라운드 실행:
+
+```bash
+./botctl.sh start
+./botctl.sh status
+./botctl.sh tail
+./botctl.sh stop
+```
+
 ## 운영 메모
 
 - `state.json`을 지우면 다음 실행 때 새 메시지를 보냅니다.
