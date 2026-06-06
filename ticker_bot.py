@@ -356,24 +356,23 @@ def render_caption(tickers: list[Ticker]) -> str:
     avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
     coinone = next((ticker for ticker in ok_tickers if ticker.exchange == "Coinone"), None)
 
-    lines = ["<b>KASPA 실시간 티커</b>", f"<code>{now}</code>"]
+    lines = ["<b>KASPA 실시간 티커</b>", now]
     if avg_usdt:
         lines.append(f"평균: <b>{avg_usdt:.6f} USDT</b>")
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
 
-    table = [f"{'Exch':<6} {'Price':>6} {'Vol':>6}"]
+    lines.append("")
+    lines.append("<b>Exchange · Price · Volume</b>")
     total_volume = 0.0
     for ticker in market_tickers(tickers):
         if not ticker.ok:
-            table.append(f"{ticker.exchange[:6]:<6} {'error':>6} {'-':>6}")
+            lines.append(f"{html.escape(ticker.exchange)} · error · -")
             continue
         if ticker.base_volume is not None:
             total_volume += ticker.base_volume
-        table.append(f"{ticker.exchange[:6]:<6} {market_price(ticker):>6} {caption_volume(ticker):>6}")
-    table.append(f"{'Total':<6} {'':>6} {compact_volume(total_volume):>6}")
-
-    lines.append(f"<pre>{html.escape(chr(10).join(table))}</pre>")
+        lines.append(f"{html.escape(ticker.exchange)} · {market_price(ticker)} · {caption_volume(ticker)}")
+    lines.append(f"Total · {compact_volume(total_volume)}")
 
     return "\n".join(lines)
 
@@ -455,10 +454,18 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
     else:
         draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
+    def draw_right(x: int, y: int, text: str, fill: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> None:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        draw.text((x - (bbox[2] - bbox[0]), y), text, fill=fill, font=font)
+
     header_y = 640
-    draw.text((84, header_y), "Exchange", fill="#9aa4b2", font=small_font)
-    draw.text((460, header_y), "Price", fill="#9aa4b2", font=small_font)
-    draw.text((780, header_y), "Volume", fill="#9aa4b2", font=small_font)
+    exchange_x = 84
+    price_right_x = 660
+    volume_right_x = 1516
+    draw.text((exchange_x, header_y), "Exchange", fill="#9aa4b2", font=small_font)
+    draw_right(price_right_x, header_y, "Price", "#9aa4b2", small_font)
+    draw_right(volume_right_x, header_y, "Volume", "#9aa4b2", small_font)
+    draw.line((84, header_y + 32, 1516, header_y + 32), fill="#2b3342", width=1)
 
     y = 678
     total_volume = 0.0
@@ -467,14 +474,16 @@ def render_chart(candles: list[Candle], tickers: list[Ticker]) -> bytes:
         color = "#37d67a" if ticker.ok else "#ff6b6b"
         if ticker.ok and ticker.base_volume is not None:
             total_volume += ticker.base_volume
-        draw.text((84, y + 3), ticker.exchange, fill=color, font=row_font)
-        draw.text((460, y + 3), market_price(ticker), fill="#f3f6fb", font=row_font)
-        draw.text((780, y + 3), market_volume(ticker), fill="#f3f6fb", font=row_font)
+        if (y - 678) // 31 % 2 == 0:
+            draw.rectangle((84, y - 1, 1516, y + 30), fill="#121720")
+        draw.text((exchange_x, y + 3), ticker.exchange, fill=color, font=row_font)
+        draw_right(price_right_x, y + 3, market_price(ticker), "#f3f6fb", row_font)
+        draw_right(volume_right_x, y + 3, market_volume(ticker), "#f3f6fb", row_font)
         y += 31
 
-    draw.line((84, y + 2, 1190, y + 2), fill="#2b3342", width=1)
-    draw.text((84, y + 8), "Total", fill="#9aa4b2", font=row_font)
-    draw.text((780, y + 8), f"{total_volume:,.0f}", fill="#f3f6fb", font=row_font)
+    draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
+    draw.text((exchange_x, y + 8), "Total", fill="#9aa4b2", font=row_font)
+    draw_right(volume_right_x, y + 8, f"{total_volume:,.0f}", "#f3f6fb", row_font)
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
