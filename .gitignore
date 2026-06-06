@@ -1,0 +1,7 @@
+.env
+state.json
+kaspa-chart.png
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
