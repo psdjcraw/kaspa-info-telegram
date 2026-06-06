@@ -57,6 +57,12 @@ class HashratePoint:
     ths: float
 
 
+@dataclass
+class TransactionPoint:
+    ts: int
+    count: int
+
+
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -283,6 +289,26 @@ def fetch_hashrate_history(hours: int = 24) -> list[HashratePoint]:
     return sorted((point for point in points if point.ts >= cutoff), key=lambda point: point.ts)
 
 
+def fetch_transaction_counts(hours: int = 24) -> list[TransactionPoint]:
+    now = datetime.now(timezone.utc)
+    days = [(now - timedelta(days=1)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")]
+    points: list[TransactionPoint] = []
+    for day in days:
+        payload = http_json(f"https://api.kaspa.org/transactions/count/{day}")
+        for row in payload:
+            timestamp_ms = row.get("timestamp")
+            count = row.get("regular")
+            if timestamp_ms is None or count is None:
+                continue
+            points.append(TransactionPoint(ts=int(int(timestamp_ms) / 1000), count=int(count)))
+
+    if not points:
+        return []
+    latest_ts = max(point.ts for point in points)
+    cutoff = latest_ts - hours * 60 * 60
+    return sorted((point for point in points if point.ts >= cutoff), key=lambda point: point.ts)
+
+
 def fetch_tickers() -> list[Ticker]:
     tickers: list[Ticker] = []
     for fetcher in FETCHERS:
@@ -459,6 +485,7 @@ def render_chart(
     hashrate_points: list[HashratePoint] | None = None,
     hashrate_ths: float | None = None,
     btc_candles: list[Candle] | None = None,
+    transaction_points: list[TransactionPoint] | None = None,
 ) -> bytes:
     width, height = 1600, 960
     image = Image.new("RGB", (width, height), "#10131a")
@@ -514,6 +541,25 @@ def render_chart(
                 )
 
             return [(x_for_ts(ts), line_y_for(value)) for ts, value in points]
+
+        transaction_points = transaction_points or []
+        visible_transactions = [
+            point
+            for point in transaction_points
+            if candle_start_ts <= point.ts <= candle_end_ts and point.count > 0
+        ]
+        if visible_transactions:
+            max_transactions = max(point.count for point in visible_transactions) or 1
+            bar_slot = (inner_right - inner_left) / 24
+            bar_width = max(10, bar_slot * 0.62)
+            max_bar_height = (chart_box[3] - chart_box[1]) * 0.32
+            for point in visible_transactions:
+                x = x_for_ts(point.ts + 30 * 60)
+                bar_height = (point.count / max_transactions) * max_bar_height
+                draw.rectangle(
+                    (x - bar_width / 2, chart_box[3] - bar_height - 2, x + bar_width / 2, chart_box[3] - 2),
+                    fill="#1f2c44",
+                )
 
         for index, candle in enumerate(candles):
             x = inner_left + index * step + step / 2
@@ -711,11 +757,16 @@ def run_once(dry_run: bool = False) -> None:
     history = update_history(state, tickers)
     hashrate_ths = None
     hashrate_points: list[HashratePoint] = []
+    transaction_points: list[TransactionPoint] = []
     try:
         hashrate_ths = fetch_hashrate()
         hashrate_points = fetch_hashrate_history()
     except Exception as exc:
         print(f"hashrate fallback: {exc}")
+    try:
+        transaction_points = fetch_transaction_counts()
+    except Exception as exc:
+        print(f"transactions fallback: {exc}")
     caption = render_caption(tickers, hashrate_ths)
     try:
         candles = fetch_gate_candles()
@@ -727,7 +778,7 @@ def run_once(dry_run: bool = False) -> None:
         btc_candles = fetch_gate_candles("BTC_USDT")
     except Exception as exc:
         print(f"btc fallback: {exc}")
-    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths, btc_candles)
+    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths, btc_candles, transaction_points)
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
