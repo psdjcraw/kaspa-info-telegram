@@ -71,6 +71,14 @@ python3 ticker_bot.py
 ./botctl.sh stop
 ```
 
+macOS launchd 상시 실행:
+
+```bash
+./install_launchd.sh
+launchctl print gui/$(id -u)/com.psdjcraw.kaspa-info-telegram
+./uninstall_launchd.sh
+```
+
 ## 운영 메모
 
 - `state.json`을 지우면 다음 실행 때 새 메시지를 보냅니다.
