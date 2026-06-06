@@ -248,6 +248,16 @@ def fmt_volume(value: float | None, unit: str) -> str:
     return f"{value:.2f} {unit}"
 
 
+def compact_volume(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}K"
+    return f"{value:.2f}"
+
+
 def render_caption(tickers: list[Ticker]) -> str:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
@@ -261,23 +271,32 @@ def render_caption(tickers: list[Ticker]) -> str:
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
 
-    table = ["EXCHANGE    PAIR        LAST          VOL(KAS)      SPRD"]
+    table = []
     for ticker in tickers:
         if not ticker.ok:
-            table.append(f"{ticker.exchange[:10]:<10}  {'KAS':<10}  {'error':>12}  {'-':>12}  {'-':>6}")
+            table.extend(
+                [
+                    f"{ticker.exchange[:10]}  KAS",
+                    "LAST  error",
+                    "VOL   - / SPRD -",
+                    "",
+                ]
+            )
             continue
         spread = "-"
         if ticker.bid and ticker.ask and ticker.bid > 0:
             spread = f"{(ticker.ask - ticker.bid) / ticker.bid * 100:.2f}%"
-        table.append(
-            f"{ticker.exchange[:10]:<10}  "
-            f"{ticker.pair:<10}  "
-            f"{price_value(ticker):>12}  "
-            f"{fmt_volume(ticker.base_volume, '').strip():>12}  "
-            f"{spread:>6}"
+        unit = ticker.unit
+        table.extend(
+            [
+                f"{ticker.exchange[:10]}  {ticker.pair}",
+                f"LAST  {price_value(ticker)} {unit}",
+                f"VOL   {compact_volume(ticker.base_volume)} KAS / SPRD {spread}",
+                "",
+            ]
         )
 
-    lines.append(f"<pre>{html.escape(chr(10).join(table))}</pre>")
+    lines.append(f"<pre>{html.escape(chr(10).join(table).rstrip())}</pre>")
 
     return "\n".join(lines)
 
