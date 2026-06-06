@@ -386,18 +386,20 @@ def run_once(dry_run: bool = False) -> None:
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
-    if state.get("last_fingerprint") == fingerprint:
+    if state.get("last_fingerprint") == fingerprint and state.get("message_id"):
         print("skip: no visible change")
         return
-    state["last_fingerprint"] = fingerprint
     save_state(state)
 
     if dry_run:
+        state["last_fingerprint"] = fingerprint
+        save_state(state)
         print(caption)
         print(f"chart: {CHART_PATH}")
         return
 
     send_or_edit_message(state, chart_png, caption)
+    state["last_fingerprint"] = fingerprint
     save_state(state)
     print(f"updated message_id={state.get('message_id')}")
 
@@ -435,7 +437,11 @@ def main() -> None:
         return
 
     if args.once:
-        run_once(dry_run=args.dry_run)
+        try:
+            run_once(dry_run=args.dry_run)
+        except RuntimeError as exc:
+            print(f"error: {exc}")
+            sys.exit(1)
     else:
         loop(max(args.interval, 5), dry_run=args.dry_run)
 
