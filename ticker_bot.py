@@ -343,6 +343,12 @@ def market_volume(ticker: Ticker) -> str:
     return f"{ticker.base_volume:,.0f}"
 
 
+def caption_volume(ticker: Ticker) -> str:
+    if not ticker.ok or ticker.base_volume is None:
+        return "-"
+    return compact_volume(ticker.base_volume)
+
+
 def render_caption(tickers: list[Ticker]) -> str:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
@@ -356,16 +362,16 @@ def render_caption(tickers: list[Ticker]) -> str:
     if coinone:
         lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
 
-    table = [f"{'Exchange':<8} {'Price':>8} {'Volume':>14}"]
+    table = [f"{'Exch':<6} {'Price':>6} {'Vol':>6}"]
     total_volume = 0.0
     for ticker in market_tickers(tickers):
         if not ticker.ok:
-            table.append(f"{ticker.exchange[:8]:<8} {'error':>8} {'-':>14}")
+            table.append(f"{ticker.exchange[:6]:<6} {'error':>6} {'-':>6}")
             continue
         if ticker.base_volume is not None:
             total_volume += ticker.base_volume
-        table.append(f"{ticker.exchange[:8]:<8} {market_price(ticker):>8} {market_volume(ticker):>14}")
-    table.append(f"{'Total':<8} {'':>8} {total_volume:>14,.0f}")
+        table.append(f"{ticker.exchange[:6]:<6} {market_price(ticker):>6} {caption_volume(ticker):>6}")
+    table.append(f"{'Total':<6} {'':>6} {compact_volume(total_volume):>6}")
 
     lines.append(f"<pre>{html.escape(chr(10).join(table))}</pre>")
 
