@@ -1706,6 +1706,44 @@ def render_chart(
             for point in transaction_points
             if candle_start_ts <= point.ts <= candle_end_ts and point.count > 0
         ]
+        hashrate_points = hashrate_points or []
+        visible_hashrates = [
+            point
+            for point in hashrate_points
+            if candle_start_ts <= point.ts <= candle_end_ts and point.ths > 0
+        ]
+        if visible_hashrates:
+            hashrate_values = [point.ths for point in visible_hashrates]
+            min_hashrate = min(hashrate_values)
+            max_hashrate = max(hashrate_values)
+            hashrate_range = max_hashrate - min_hashrate
+            hashrate_diffs = [
+                later.ts - earlier.ts
+                for earlier, later in zip(visible_hashrates, visible_hashrates[1:])
+                if later.ts > earlier.ts
+            ]
+            hashrate_bucket_seconds = min(hashrate_diffs) if hashrate_diffs else 15 * 60
+            hashrate_slot = (hashrate_bucket_seconds / max(candle_end_ts - candle_start_ts, 1)) * (inner_right - inner_left)
+            hashrate_bar_width = max(5, min(28, hashrate_slot * 0.80))
+            max_hashrate_bar_height = (chart_box[3] - chart_box[1]) * 0.22
+            for point in visible_hashrates:
+                x = x_for_ts(point.ts)
+                if hashrate_range > 0:
+                    normalized = (point.ths - min_hashrate) / hashrate_range
+                else:
+                    normalized = 0.65
+                bar_height = 16 + normalized * (max_hashrate_bar_height - 16)
+                draw.rectangle(
+                    (
+                        x - hashrate_bar_width / 2,
+                        chart_box[3] - bar_height - 2,
+                        x + hashrate_bar_width / 2,
+                        chart_box[3] - 2,
+                    ),
+                    fill="#241827",
+                    outline="#4a2438",
+                )
+
         if visible_transactions:
             max_transactions = max(point.count for point in visible_transactions) or 1
             transaction_diffs = [
@@ -1753,6 +1791,34 @@ def render_chart(
                 font=small_font,
             )
 
+        if visible_hashrates:
+            latest_hashrate = hashrate_ths or visible_hashrates[-1].ths
+            hashrate_text = f"HR {fmt_hashrate(latest_hashrate)}"
+            hashrate_bbox = draw.textbbox((0, 0), hashrate_text, font=small_font)
+            hashrate_pad_x, hashrate_pad_y = 8, 5
+            hashrate_width = hashrate_bbox[2] - hashrate_bbox[0] + hashrate_pad_x * 2
+            hashrate_height = hashrate_bbox[3] - hashrate_bbox[1] + hashrate_pad_y * 2
+            hashrate_label_x = label_left
+            hashrate_label_y = chart_box[3] - hashrate_height - 54
+            draw.rounded_rectangle(
+                (
+                    hashrate_label_x,
+                    hashrate_label_y,
+                    hashrate_label_x + hashrate_width,
+                    hashrate_label_y + hashrate_height,
+                ),
+                radius=5,
+                fill="#0b0e13",
+                outline="#8a3d5c",
+                width=1,
+            )
+            draw.text(
+                (hashrate_label_x + hashrate_pad_x, hashrate_label_y + hashrate_pad_y - hashrate_bbox[1]),
+                hashrate_text,
+                fill="#ff8fac",
+                font=small_font,
+            )
+
         for index, candle in enumerate(candles):
             x = inner_left + index * step + step / 2
             open_y = y_for(candle.open)
@@ -1770,23 +1836,6 @@ def render_chart(
         last = candles[-1]
         last_x = inner_left + (len(candles) - 1) * step + step / 2
 
-        hashrate_points = hashrate_points or []
-        visible_hashrates = [
-            point
-            for point in hashrate_points
-            if candle_start_ts <= point.ts <= candle_end_ts and point.ths > 0
-        ]
-        hashrate_label: tuple[float, float, str, str] | None = None
-        if len(visible_hashrates) >= 2:
-            line_points = scaled_line_points([(point.ts, point.ths) for point in visible_hashrates])
-            draw.line(line_points, fill="#ff304f", width=3, joint="curve")
-            hashrate_label = (
-                line_points[-1][0],
-                line_points[-1][1],
-                f"Hashrate {fmt_hashrate(hashrate_ths or visible_hashrates[-1].ths)}",
-                "#ff7184",
-            )
-
         btc_candles = btc_candles or []
         visible_btc = [
             candle
@@ -1800,8 +1849,6 @@ def render_chart(
             btc_label = (line_points[-1][0], line_points[-1][1], f"BTC {fmt_btc_price(visible_btc[-1].close)}", "#78bdff")
 
         draw_end_label(last_x, y_for(last.close), f"KAS {last.close:.6f}", "#f3f6fb")
-        if hashrate_label:
-            draw_end_label(*hashrate_label)
         if btc_label:
             draw_end_label(*btc_label)
 
