@@ -1665,8 +1665,13 @@ def pad_right(text: str, width: int) -> str:
     return text + " " * max(0, width - display_width(text))
 
 
-def caption_summary_row(label: str, value: str) -> str:
-    return f"{pad_right(label, 9)} {pad_left(value, 18)}"
+def caption_summary_row(label: str, value: str, value_width: int) -> str:
+    return f"{pad_right(label, 9)} {pad_left(value, value_width)}"
+
+
+def format_caption_summary_rows(rows: list[tuple[str, str]]) -> list[str]:
+    value_width = max([18, *(display_width(value) for _, value in rows)])
+    return [caption_summary_row(label, value, value_width) for label, value in rows]
 
 
 def render_caption(
@@ -1691,53 +1696,53 @@ def render_caption(
     premium = kimchi_premium(avg_usdt, coinone, usdt_krw)
     basis = futures_basis(avg_usdt, tickers)
 
-    summary_rows = []
+    summary_rows: list[tuple[str, str]] = []
     if avg_usdt:
-        summary_rows.append(caption_summary_row("Avg", f"{avg_usdt:.6f} USDT"))
+        summary_rows.append(("Avg", f"{avg_usdt:.6f} USDT"))
     if coinone:
-        summary_rows.append(caption_summary_row("KRW", f"{coinone.last:,.2f} KRW"))
+        summary_rows.append(("KRW", f"{coinone.last:,.2f} KRW"))
     if usdt_krw is None and avg_usdt and coinone:
         usdt_krw = coinone.last / avg_usdt
     if usdt_krw:
-        summary_rows.append(caption_summary_row("USDT/KRW", f"{usdt_krw:,.2f} KRW"))
+        summary_rows.append(("USDT/KRW", f"{usdt_krw:,.2f} KRW"))
     if premium is not None:
-        summary_rows.append(caption_summary_row("Kimchi", f"{premium:+.2f}%"))
+        summary_rows.append(("Kimchi", f"{premium:+.2f}%"))
     if basis is not None:
-        summary_rows.append(caption_summary_row("Basis", f"{basis:+.2f}%"))
+        summary_rows.append(("Basis", f"{basis:+.2f}%"))
     if settings.get("show_futures_interpretation", True):
-        summary_rows.append(caption_summary_row("Futures", futures_interpretation(tickers, basis)))
+        summary_rows.append(("Futures", futures_interpretation(tickers, basis)))
     if fear_greed is not None:
-        summary_rows.append(caption_summary_row("F&G", fmt_fear_greed(fear_greed)))
+        summary_rows.append(("F&G", fmt_fear_greed(fear_greed)))
     if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
-        summary_rows.append(caption_summary_row("Ranks", fmt_global_ranks(global_ranks)))
+        summary_rows.append(("Ranks", fmt_global_ranks(global_ranks)))
     if market_dominance is not None:
-        summary_rows.append(caption_summary_row("Dominance", fmt_market_dominance(market_dominance)))
+        summary_rows.append(("Dominance", fmt_market_dominance(market_dominance)))
     futures_caption = caption_futures_summary(tickers)
     if futures_caption:
-        summary_rows.append(caption_summary_row("Fut Vol", futures_caption))
+        summary_rows.append(("Fut Vol", futures_caption))
     oi_caption = caption_open_interest_summary(tickers)
     if oi_caption:
-        summary_rows.append(caption_summary_row("OI", oi_caption))
+        summary_rows.append(("OI", oi_caption))
     funding_caption = caption_funding_summary(tickers)
     if funding_caption:
-        summary_rows.append(caption_summary_row("Funding", funding_caption))
-    summary_rows.append(caption_summary_row("Interest", f"{interest_score(tickers):+.1f}"))
+        summary_rows.append(("Funding", funding_caption))
+    summary_rows.append(("Interest", f"{interest_score(tickers):+.1f}"))
     alerts = caption_alerts(tickers, premium, basis)
     if alerts:
-        summary_rows.append(caption_summary_row("Alerts", alerts))
+        summary_rows.append(("Alerts", alerts))
     if data_status:
-        summary_rows.append(caption_summary_row("Data", data_status))
+        summary_rows.append(("Data", data_status))
     api_text = api_performance_text(api_performance)
     if api_text and settings.get("show_api_quality", True):
-        summary_rows.append(caption_summary_row("API", api_text))
-    summary_rows.append(caption_summary_row("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
+        summary_rows.append(("API", api_text))
+    summary_rows.append(("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
-        summary_rows.append(caption_summary_row("Hashrate", fmt_hashrate(hashrate_ths)))
+        summary_rows.append(("Hashrate", fmt_hashrate(hashrate_ths)))
 
     lines = ["<b>KASPA 실시간 티커</b>", f"<code>{html.escape(now)}</code>"]
     if summary_rows:
         lines.append("<b>Market / Network</b>")
-        for row in summary_rows:
+        for row in format_caption_summary_rows(summary_rows):
             lines.append(f"<code>{html.escape(row)}</code>")
 
     lines.append("")
