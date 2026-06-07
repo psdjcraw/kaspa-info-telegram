@@ -1706,6 +1706,14 @@ def render_chart(
             for point in transaction_points
             if candle_start_ts <= point.ts <= candle_end_ts and point.count > 0
         ]
+        bar_panel_height = (chart_box[3] - chart_box[1]) * 0.30
+        bar_panel_top = chart_box[3] - bar_panel_height - 2
+        bar_panel_mid = bar_panel_top + bar_panel_height / 2
+        bar_panel_bottom = chart_box[3] - 2
+        draw.line((inner_left, bar_panel_mid, inner_right, bar_panel_mid), fill="#394861", width=2)
+        draw.text((inner_left + 8, bar_panel_top + 4), "HR", fill="#8a3d5c", font=small_font)
+        draw.text((inner_left + 8, bar_panel_mid + 4), "TX", fill="#5f7eb6", font=small_font)
+
         hashrate_points = hashrate_points or []
         visible_hashrates = [
             point
@@ -1725,20 +1733,20 @@ def render_chart(
             hashrate_bucket_seconds = min(hashrate_diffs) if hashrate_diffs else 15 * 60
             hashrate_slot = (hashrate_bucket_seconds / max(candle_end_ts - candle_start_ts, 1)) * (inner_right - inner_left)
             hashrate_bar_width = max(5, min(28, hashrate_slot * 0.80))
-            max_hashrate_bar_height = (chart_box[3] - chart_box[1]) * 0.22
+            max_hashrate_bar_height = (bar_panel_height / 2) - 8
             for point in visible_hashrates:
                 x = x_for_ts(point.ts)
                 if hashrate_range > 0:
                     normalized = (point.ths - min_hashrate) / hashrate_range
                 else:
                     normalized = 0.65
-                bar_height = 16 + normalized * (max_hashrate_bar_height - 16)
+                bar_height = 8 + normalized * max_hashrate_bar_height
                 draw.rectangle(
                     (
                         x - hashrate_bar_width / 2,
-                        chart_box[3] - bar_height - 2,
+                        bar_panel_mid - bar_height,
                         x + hashrate_bar_width / 2,
-                        chart_box[3] - 2,
+                        bar_panel_mid - 1,
                     ),
                     fill="#241827",
                     outline="#4a2438",
@@ -1754,15 +1762,15 @@ def render_chart(
             transaction_bucket_seconds = min(transaction_diffs) if transaction_diffs else TRANSACTION_BUCKET_SECONDS
             bar_slot = (transaction_bucket_seconds / max(candle_end_ts - candle_start_ts, 1)) * (inner_right - inner_left)
             bar_width = max(3, min(20, bar_slot * 0.72))
-            max_bar_height = (chart_box[3] - chart_box[1]) * 0.32
+            max_bar_height = (bar_panel_height / 2) - 8
             last_transaction = visible_transactions[-1]
             last_transaction_x = x_for_ts(last_transaction.ts + transaction_bucket_seconds // 2)
-            last_transaction_height = (last_transaction.count / max_transactions) * max_bar_height
+            last_transaction_height = 8 + (last_transaction.count / max_transactions) * max_bar_height
             for point in visible_transactions:
                 x = x_for_ts(point.ts + transaction_bucket_seconds // 2)
-                bar_height = (point.count / max_transactions) * max_bar_height
+                bar_height = 8 + (point.count / max_transactions) * max_bar_height
                 draw.rectangle(
-                    (x - bar_width / 2, chart_box[3] - bar_height - 2, x + bar_width / 2, chart_box[3] - 2),
+                    (x - bar_width / 2, bar_panel_mid + 1, x + bar_width / 2, min(bar_panel_bottom, bar_panel_mid + bar_height)),
                     fill="#1f2c44",
                 )
             tx_text = f"TX {compact_count(last_transaction.count)}/5m  max {compact_count(max_transactions)}"
@@ -1771,11 +1779,8 @@ def render_chart(
             tx_width = tx_bbox[2] - tx_bbox[0] + tx_pad_x * 2
             tx_height = tx_bbox[3] - tx_bbox[1] + tx_pad_y * 2
             tx_label_x = label_left
-            tx_label_y = chart_box[3] - tx_height - 14
-            tx_anchor_y = max(
-                chart_box[1] + 18,
-                min(chart_box[3] - last_transaction_height - 2, chart_box[3] - 18),
-            )
+            tx_label_y = min(chart_box[3] - tx_height - 8, bar_panel_mid + 8)
+            tx_anchor_y = min(bar_panel_bottom - 8, bar_panel_mid + last_transaction_height)
             draw.line((last_transaction_x + 6, tx_anchor_y, tx_label_x - 8, tx_label_y + tx_height / 2), fill="#5f7eb6", width=1)
             draw.rounded_rectangle(
                 (tx_label_x, tx_label_y, tx_label_x + tx_width, tx_label_y + tx_height),
@@ -1799,7 +1804,7 @@ def render_chart(
             hashrate_width = hashrate_bbox[2] - hashrate_bbox[0] + hashrate_pad_x * 2
             hashrate_height = hashrate_bbox[3] - hashrate_bbox[1] + hashrate_pad_y * 2
             hashrate_label_x = label_left
-            hashrate_label_y = chart_box[3] - hashrate_height - 54
+            hashrate_label_y = max(bar_panel_top + 4, bar_panel_mid - hashrate_height - 8)
             draw.rounded_rectangle(
                 (
                     hashrate_label_x,
