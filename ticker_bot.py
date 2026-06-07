@@ -29,6 +29,8 @@ KST = timezone(timedelta(hours=9))
 IMAGE_SCALE = 1.3
 TRANSACTION_BUCKET_SECONDS = 5 * 60
 TOCATA_HARDFORK_AT = datetime(2026, 6, 30, 16, 15, tzinfo=timezone.utc)
+MARKET_RANK_CACHE_SECONDS = 5 * 60
+SLOW_INDEX_CACHE_SECONDS = 15 * 60
 
 
 @dataclass
@@ -49,6 +51,9 @@ class Ticker:
     futures_quote_volume: float | None = None
     futures_last: float | None = None
     futures_only: bool = False
+    market_rank_delta: int | None = None
+    spot_volume_delta_pct: float | None = None
+    futures_volume_delta_pct: float | None = None
 
 
 @dataclass
@@ -114,6 +119,22 @@ def save_state(state: dict[str, Any]) -> None:
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=2)
     tmp_path.replace(STATE_PATH)
+
+
+def cached_value(
+    state: dict[str, Any],
+    key: str,
+    ttl_seconds: int,
+    fetcher: Callable[[], Any],
+) -> Any:
+    now = int(time.time())
+    cache = state.setdefault("cache", {})
+    item = cache.get(key)
+    if isinstance(item, dict) and now - int(item.get("ts", 0)) < ttl_seconds and "value" in item:
+        return item["value"]
+    value = fetcher()
+    cache[key] = {"ts": now, "value": value}
+    return value
 
 
 def http_json(url: str, timeout: float = 8.0) -> Any:
@@ -221,6 +242,37 @@ def fetch_global_ranks() -> GlobalRanks:
     except Exception as exc:
         print(f"coingecko rank fallback: {exc}")
     return ranks
+
+
+def fetch_fear_greed_index_cached(state: dict[str, Any]) -> FearGreedIndex:
+    def fetch() -> dict[str, Any]:
+        index = fetch_fear_greed_index()
+        return {"value": index.value, "classification": index.classification}
+
+    value = cached_value(
+        state,
+        "fear_greed",
+        SLOW_INDEX_CACHE_SECONDS,
+        fetch,
+    )
+    return FearGreedIndex(value=int(value["value"]), classification=str(value["classification"]))
+
+
+def fetch_global_ranks_cached(state: dict[str, Any]) -> GlobalRanks:
+    def fetch() -> dict[str, Any]:
+        ranks = fetch_global_ranks()
+        return {"coinmarketcap": ranks.coinmarketcap, "coingecko": ranks.coingecko}
+
+    value = cached_value(
+        state,
+        "global_ranks",
+        SLOW_INDEX_CACHE_SECONDS,
+        fetch,
+    )
+    return GlobalRanks(
+        coinmarketcap=value.get("coinmarketcap"),
+        coingecko=value.get("coingecko"),
+    )
 
 
 def fetch_gate() -> Ticker:
@@ -717,7 +769,7 @@ def apply_market_changes(tickers: list[Ticker]) -> None:
             ticker.error = ticker.error or f"market change: {str(exc)[:80]}"
 
 
-def apply_market_ranks(tickers: list[Ticker]) -> None:
+def apply_market_ranks(state: dict[str, Any], tickers: list[Ticker]) -> None:
     for ticker in tickers:
         if not ticker.ok:
             continue
@@ -725,7 +777,12 @@ def apply_market_ranks(tickers: list[Ticker]) -> None:
         if not fetcher:
             continue
         try:
-            ticker.market_rank = fetcher()
+            ticker.market_rank = cached_value(
+                state,
+                f"market_rank:{ticker.exchange}",
+                MARKET_RANK_CACHE_SECONDS,
+                fetcher,
+            )
         except Exception as exc:
             ticker.error = ticker.error or f"market rank: {str(exc)[:80]}"
 
@@ -892,7 +949,7 @@ def update_transaction_5m_history(state: dict[str, Any], hours: int = 24) -> lis
     return [TransactionPoint(ts=point["ts"], count=point["count"]) for point in points]
 
 
-def fetch_tickers() -> list[Ticker]:
+def fetch_tickers(state: dict[str, Any]) -> list[Ticker]:
     tickers: list[Ticker] = []
     for fetcher in FETCHERS:
         try:
@@ -913,7 +970,7 @@ def fetch_tickers() -> list[Ticker]:
                 )
             )
     apply_market_changes(tickers)
-    apply_market_ranks(tickers)
+    apply_market_ranks(state, tickers)
     apply_futures_volumes(tickers)
     tickers.extend(fetch_futures_only_tickers())
     return tickers
@@ -992,6 +1049,24 @@ def quote_volume_millions(value: float | None) -> str:
     return f"{value / 1_000_000:.2f}M"
 
 
+def delta_suffix(value: float | None, threshold: float = 0.1) -> str:
+    if value is None or abs(value) < threshold:
+        return ""
+    return f"{value:+.0f}%"
+
+
+def rank_delta_suffix(value: int | None) -> str:
+    if value is None or value == 0:
+        return ""
+    return f"+{value}" if value > 0 else str(value)
+
+
+def volume_with_delta(value: float | None, delta_pct: float | None) -> str:
+    base = quote_volume_millions(value)
+    suffix = delta_suffix(delta_pct)
+    return f"{base}{suffix}" if suffix else base
+
+
 def compact_count(value: int | float | None) -> str:
     if value is None:
         return "-"
@@ -1058,6 +1133,34 @@ def quote_volume_value(ticker: Ticker) -> float | None:
     return None
 
 
+def ticker_metric_key(ticker: Ticker) -> str:
+    return f"futures:{ticker.exchange}" if ticker.futures_only else f"spot:{ticker.exchange}"
+
+
+def apply_metric_deltas(state: dict[str, Any], tickers: list[Ticker]) -> None:
+    previous = state.get("previous_metrics", {})
+    current: dict[str, dict[str, Any]] = {}
+    for ticker in tickers:
+        if not ticker.ok or ticker.exchange == "Coinone":
+            continue
+        key = ticker_metric_key(ticker)
+        old = previous.get(key, {}) if isinstance(previous, dict) else {}
+        spot_volume = quote_volume_value(ticker)
+        futures_volume = ticker.futures_quote_volume
+        if ticker.market_rank is not None and old.get("rank") is not None:
+            ticker.market_rank_delta = int(old["rank"]) - int(ticker.market_rank)
+        if spot_volume is not None and old.get("spot_volume") not in (None, 0):
+            ticker.spot_volume_delta_pct = ((spot_volume - float(old["spot_volume"])) / float(old["spot_volume"])) * 100
+        if futures_volume is not None and old.get("futures_volume") not in (None, 0):
+            ticker.futures_volume_delta_pct = ((futures_volume - float(old["futures_volume"])) / float(old["futures_volume"])) * 100
+        current[key] = {
+            "rank": ticker.market_rank,
+            "spot_volume": spot_volume,
+            "futures_volume": futures_volume,
+        }
+    state["previous_metrics"] = current
+
+
 def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
     return sorted(
         [ticker for ticker in tickers if ticker.exchange != "Coinone"],
@@ -1077,19 +1180,20 @@ def market_price(ticker: Ticker) -> str:
 def market_volume(ticker: Ticker) -> str:
     if not ticker.ok:
         return "-"
-    return quote_volume_millions(quote_volume_value(ticker))
+    return volume_with_delta(quote_volume_value(ticker), ticker.spot_volume_delta_pct)
 
 
 def market_futures_volume(ticker: Ticker) -> str:
     if not ticker.ok:
         return "-"
-    return quote_volume_millions(ticker.futures_quote_volume)
+    return volume_with_delta(ticker.futures_quote_volume, ticker.futures_volume_delta_pct)
 
 
 def market_rank(ticker: Ticker) -> str:
     if not ticker.ok or ticker.market_rank is None:
         return "-"
-    return f"#{ticker.market_rank}"
+    prefix = "F" if ticker.futures_only else "S"
+    return f"{prefix}#{ticker.market_rank}{rank_delta_suffix(ticker.market_rank_delta)}"
 
 
 def volume_change_value(ticker: Ticker) -> str:
@@ -1130,6 +1234,37 @@ def caption_volume(ticker: Ticker) -> str:
 
 def caption_total_volume(value: float) -> str:
     return quote_volume_millions(value)
+
+
+def futures_summary(tickers: list[Ticker]) -> tuple[float, Ticker | None]:
+    futures = [
+        ticker
+        for ticker in tickers
+        if ticker.ok and ticker.futures_quote_volume is not None and ticker.futures_quote_volume > 0
+    ]
+    total = sum(float(ticker.futures_quote_volume or 0) for ticker in futures)
+    top = max(futures, key=lambda ticker: ticker.futures_quote_volume or 0, default=None)
+    return total, top
+
+
+def caption_futures_summary(tickers: list[Ticker]) -> str | None:
+    total, top = futures_summary(tickers)
+    if total <= 0 or top is None:
+        return None
+    return f"{quote_volume_millions(total)} top {caption_exchange(top.exchange)}"
+
+
+def api_error_labels(tickers: list[Ticker], extra_errors: list[str] | None = None) -> list[str]:
+    labels = []
+    for ticker in tickers:
+        if ticker.error:
+            labels.append(ticker.exchange)
+    labels.extend(extra_errors or [])
+    deduped = []
+    for label in labels:
+        if label not in deduped:
+            deduped.append(label)
+    return deduped
 
 
 def caption_change(value: float | None) -> str:
@@ -1198,6 +1333,9 @@ def render_caption(
         summary_rows.append(caption_summary_row("F&G", fmt_fear_greed(fear_greed)))
     if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
         summary_rows.append(caption_summary_row("Ranks", fmt_global_ranks(global_ranks)))
+    futures_caption = caption_futures_summary(tickers)
+    if futures_caption:
+        summary_rows.append(caption_summary_row("Fut Vol", futures_caption))
     summary_rows.append(caption_summary_row("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
         summary_rows.append(caption_summary_row("Hashrate", fmt_hashrate(hashrate_ths)))
@@ -1246,6 +1384,7 @@ def render_chart(
     btc_candles: list[Candle] | None = None,
     transaction_points: list[TransactionPoint] | None = None,
     display_dt: datetime | None = None,
+    api_errors: list[str] | None = None,
 ) -> bytes:
     width, height = 1600, 1080
     image = Image.new("RGB", (width, height), "#10131a")
@@ -1501,6 +1640,12 @@ def render_chart(
     draw_right(volume_right_x, y + 8, quote_volume_millions(total_volume), "#f3f6fb", row_font)
     draw_right(futures_volume_right_x, y + 8, quote_volume_millions(total_futures_volume), "#f3f6fb", row_font)
 
+    if api_errors:
+        error_text = "API miss: " + ", ".join(api_errors[:6])
+        if len(api_errors) > 6:
+            error_text += f" +{len(api_errors) - 6}"
+        draw.text((84, height - 34), error_text, fill="#ff9f43", font=small_font)
+
     if IMAGE_SCALE != 1:
         image = image.resize((int(width * IMAGE_SCALE), int(height * IMAGE_SCALE)), Image.Resampling.LANCZOS)
 
@@ -1602,7 +1747,9 @@ def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) 
 def run_once(dry_run: bool = False) -> None:
     display_dt = datetime.now(KST).replace(second=0, microsecond=0)
     state = load_state()
-    tickers = fetch_tickers()
+    run_errors: list[str] = []
+    tickers = fetch_tickers(state)
+    apply_metric_deltas(state, tickers)
     history = update_history(state, tickers)
     hashrate_ths = None
     usdt_krw = None
@@ -1614,35 +1761,51 @@ def run_once(dry_run: bool = False) -> None:
         usdt_krw = fetch_usdt_krw()
     except Exception as exc:
         print(f"usdt/krw fallback: {exc}")
+        run_errors.append("USDT/KRW")
     try:
-        fear_greed = fetch_fear_greed_index()
+        fear_greed = fetch_fear_greed_index_cached(state)
     except Exception as exc:
         print(f"fear greed fallback: {exc}")
+        run_errors.append("F&G")
     try:
-        global_ranks = fetch_global_ranks()
+        global_ranks = fetch_global_ranks_cached(state)
     except Exception as exc:
         print(f"global ranks fallback: {exc}")
+        run_errors.append("Ranks")
     try:
         hashrate_ths = fetch_hashrate()
         hashrate_points = fetch_hashrate_history()
     except Exception as exc:
         print(f"hashrate fallback: {exc}")
+        run_errors.append("Hashrate")
     try:
         transaction_points = update_transaction_5m_history(state)
     except Exception as exc:
         print(f"transactions fallback: {exc}")
+        run_errors.append("TX")
     caption = render_caption(tickers, hashrate_ths, display_dt, usdt_krw, fear_greed, global_ranks)
     try:
         candles = fetch_gate_candles()
     except Exception as exc:
         print(f"candle fallback: {exc}")
+        run_errors.append("Candles")
         candles = history_as_candles(history)
     btc_candles: list[Candle] = []
     try:
         btc_candles = fetch_gate_candles("BTC_USDT")
     except Exception as exc:
         print(f"btc fallback: {exc}")
-    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths, btc_candles, transaction_points, display_dt)
+        run_errors.append("BTC")
+    chart_png = render_chart(
+        candles,
+        tickers,
+        hashrate_points,
+        hashrate_ths,
+        btc_candles,
+        transaction_points,
+        display_dt,
+        api_error_labels(tickers, run_errors),
+    )
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
