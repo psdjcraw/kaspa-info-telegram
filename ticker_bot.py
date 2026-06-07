@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "state.json"
+SETTINGS_PATH = ROOT / "settings.json"
 CHART_PATH = ROOT / "kaspa-chart.png"
 KST = timezone(timedelta(hours=9))
 IMAGE_SCALE = 1.3
@@ -31,6 +32,12 @@ TRANSACTION_BUCKET_SECONDS = 5 * 60
 TOCATA_HARDFORK_AT = datetime(2026, 6, 30, 16, 15, tzinfo=timezone.utc)
 MARKET_RANK_CACHE_SECONDS = 5 * 60
 SLOW_INDEX_CACHE_SECONDS = 15 * 60
+HTTP_METRICS: list[dict[str, Any]] = []
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "show_aux_panel": True,
+    "show_futures_interpretation": True,
+    "show_api_quality": True,
+}
 
 
 @dataclass
@@ -117,6 +124,16 @@ def load_state() -> dict[str, Any]:
         return json.load(handle)
 
 
+def load_settings() -> dict[str, Any]:
+    settings = dict(DEFAULT_SETTINGS)
+    if SETTINGS_PATH.exists():
+        with SETTINGS_PATH.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            settings.update(loaded)
+    return settings
+
+
 def save_state(state: dict[str, Any]) -> None:
     tmp_path = STATE_PATH.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
@@ -143,6 +160,8 @@ def cached_value(
 
 
 def http_json(url: str, timeout: float = 8.0) -> Any:
+    started_at = time.perf_counter()
+    host = urllib.parse.urlparse(url).netloc
     request = urllib.request.Request(
         url,
         headers={
@@ -150,8 +169,14 @@ def http_json(url: str, timeout: float = 8.0) -> Any:
             "User-Agent": "kaspa-info-telegram/1.0",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        HTTP_METRICS.append({"host": host, "ms": int((time.perf_counter() - started_at) * 1000), "ok": False})
+        raise
+    HTTP_METRICS.append({"host": host, "ms": int((time.perf_counter() - started_at) * 1000), "ok": True})
+    return payload
 
 
 def as_float(value: Any) -> float | None:
@@ -1387,6 +1412,52 @@ def futures_basis(avg_usdt: float | None, tickers: list[Ticker]) -> float | None
     return sum(basis_values) / len(basis_values)
 
 
+def futures_interpretation(tickers: list[Ticker], basis: float | None) -> str:
+    average_funding, _, _ = funding_summary(tickers)
+    oi_delta_values = [
+        ticker.open_interest_delta_pct
+        for ticker in tickers
+        if ticker.open_interest_delta_pct is not None
+    ]
+    futures_volume_delta_values = [
+        ticker.futures_volume_delta_pct
+        for ticker in tickers
+        if ticker.futures_volume_delta_pct is not None
+    ]
+    avg_oi_delta = sum(oi_delta_values) / len(oi_delta_values) if oi_delta_values else None
+    avg_futures_volume_delta = (
+        sum(futures_volume_delta_values) / len(futures_volume_delta_values)
+        if futures_volume_delta_values
+        else None
+    )
+
+    heat = 0
+    if average_funding is not None:
+        if average_funding >= 0.0001:
+            heat += 1
+        elif average_funding <= -0.00005:
+            heat -= 1
+    if basis is not None:
+        if basis >= 0.25:
+            heat += 1
+        elif basis <= -0.25:
+            heat -= 1
+    if avg_oi_delta is not None and avg_oi_delta >= 3:
+        heat += 1
+    if avg_futures_volume_delta is not None and avg_futures_volume_delta >= 8:
+        heat += 1
+
+    if heat >= 2:
+        return "long-hot"
+    if heat <= -2:
+        return "short-heavy"
+    if avg_oi_delta is not None and avg_oi_delta >= 3:
+        return "OI rising"
+    if average_funding is not None and abs(average_funding) < 0.00003 and (basis is None or abs(basis) < 0.15):
+        return "neutral"
+    return "mixed"
+
+
 def interest_score(tickers: list[Ticker]) -> float:
     score = 0.0
     for ticker in tickers:
@@ -1417,6 +1488,17 @@ def caption_alerts(tickers: list[Ticker], premium: float | None, basis: float | 
     )
     if top_futures_delta is not None and top_futures_delta >= 10:
         alerts.append(f"FutVol +{top_futures_delta:.0f}%")
+    top_oi_delta = max(
+        (ticker.open_interest_delta_pct for ticker in tickers if ticker.open_interest_delta_pct is not None),
+        default=None,
+    )
+    if top_oi_delta is not None and top_oi_delta >= 8:
+        alerts.append(f"OI +{top_oi_delta:.0f}%")
+    average_funding, highest_funding, _ = funding_summary(tickers)
+    if highest_funding and highest_funding.futures_funding_rate is not None and highest_funding.futures_funding_rate >= 0.00015:
+        alerts.append(f"Fund {caption_exchange(highest_funding.exchange)} hot")
+    elif average_funding is not None and average_funding <= -0.00005:
+        alerts.append("Funding short")
     if premium is not None and abs(premium) >= 1.0:
         alerts.append(f"Kimchi {premium:+.1f}%")
     if basis is not None and abs(basis) >= 0.25:
@@ -1476,6 +1558,32 @@ def data_status_text(state: dict[str, Any], error_labels: list[str]) -> str:
     return "fresh; cache <=5m"
 
 
+def update_api_performance(state: dict[str, Any]) -> dict[str, Any] | None:
+    if not HTTP_METRICS:
+        return None
+    ok_metrics = [metric for metric in HTTP_METRICS if metric.get("ok")]
+    if not ok_metrics:
+        return None
+    average_ms = int(sum(int(metric["ms"]) for metric in ok_metrics) / len(ok_metrics))
+    slowest = max(ok_metrics, key=lambda metric: int(metric.get("ms", 0)))
+    host = str(slowest.get("host", "api")).replace("api.", "").replace("www.", "")
+    summary = {
+        "ts": int(time.time()),
+        "count": len(ok_metrics),
+        "avg_ms": average_ms,
+        "slow_host": host.split(".")[0],
+        "slow_ms": int(slowest.get("ms", 0)),
+    }
+    state["api_performance"] = summary
+    return summary
+
+
+def api_performance_text(summary: dict[str, Any] | None) -> str | None:
+    if not summary:
+        return None
+    return f"{summary.get('avg_ms', 0)}ms slow {summary.get('slow_host', '-')}"
+
+
 def caption_change(value: float | None) -> str:
     if value is None:
         return "-"
@@ -1522,7 +1630,10 @@ def render_caption(
     fear_greed: FearGreedIndex | None = None,
     global_ranks: GlobalRanks | None = None,
     data_status: str | None = None,
+    api_performance: dict[str, Any] | None = None,
+    settings: dict[str, Any] | None = None,
 ) -> str:
+    settings = settings or DEFAULT_SETTINGS
     display_dt = display_dt or datetime.now(KST).replace(second=0, microsecond=0)
     now = display_dt.strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
@@ -1545,6 +1656,8 @@ def render_caption(
         summary_rows.append(caption_summary_row("Kimchi", f"{premium:+.2f}%"))
     if basis is not None:
         summary_rows.append(caption_summary_row("Basis", f"{basis:+.2f}%"))
+    if settings.get("show_futures_interpretation", True):
+        summary_rows.append(caption_summary_row("Futures", futures_interpretation(tickers, basis)))
     if fear_greed is not None:
         summary_rows.append(caption_summary_row("F&G", fmt_fear_greed(fear_greed)))
     if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
@@ -1564,6 +1677,9 @@ def render_caption(
         summary_rows.append(caption_summary_row("Alerts", alerts))
     if data_status:
         summary_rows.append(caption_summary_row("Data", data_status))
+    api_text = api_performance_text(api_performance)
+    if api_text and settings.get("show_api_quality", True):
+        summary_rows.append(caption_summary_row("API", api_text))
     summary_rows.append(caption_summary_row("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
         summary_rows.append(caption_summary_row("Hashrate", fmt_hashrate(hashrate_ths)))
@@ -1710,9 +1826,6 @@ def render_chart(
         bar_panel_top = chart_box[3] - bar_panel_height - 2
         bar_panel_mid = bar_panel_top + bar_panel_height / 2
         bar_panel_bottom = chart_box[3] - 2
-        draw.line((inner_left, bar_panel_mid, inner_right, bar_panel_mid), fill="#394861", width=2)
-        draw.text((inner_left + 8, bar_panel_top + 4), "HR", fill="#8a3d5c", font=small_font)
-        draw.text((inner_left + 8, bar_panel_mid + 4), "TX", fill="#5f7eb6", font=small_font)
 
         hashrate_points = hashrate_points or []
         visible_hashrates = [
@@ -1720,6 +1833,16 @@ def render_chart(
             for point in hashrate_points
             if candle_start_ts <= point.ts <= candle_end_ts and point.ths > 0
         ]
+        if visible_hashrates or visible_transactions:
+            draw.rounded_rectangle(
+                (inner_left, bar_panel_top, inner_right, bar_panel_bottom),
+                radius=5,
+                outline="#223047",
+                width=1,
+            )
+            draw.line((inner_left, bar_panel_mid, inner_right, bar_panel_mid), fill="#394861", width=2)
+            draw.text((inner_left + 8, bar_panel_top + 4), "HR", fill="#ff8fac", font=small_font)
+            draw.text((inner_left + 8, bar_panel_mid + 4), "TX", fill="#9fb8ee", font=small_font)
         if visible_hashrates:
             hashrate_values = [point.ths for point in visible_hashrates]
             min_hashrate = min(hashrate_values)
@@ -2038,7 +2161,9 @@ def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) 
 
 
 def run_once(dry_run: bool = False) -> None:
+    HTTP_METRICS.clear()
     display_dt = datetime.now(KST).replace(second=0, microsecond=0)
+    settings = load_settings()
     state = load_state()
     run_errors: list[str] = []
     tickers = fetch_tickers(state)
@@ -2089,6 +2214,7 @@ def run_once(dry_run: bool = False) -> None:
         print(f"btc fallback: {exc}")
         run_errors.append("BTC")
     error_labels = update_api_status(state, tickers, run_errors)
+    api_performance = update_api_performance(state)
     status_text = data_status_text(state, error_labels)
     caption = render_caption(
         tickers,
@@ -2098,14 +2224,18 @@ def run_once(dry_run: bool = False) -> None:
         fear_greed,
         global_ranks,
         status_text,
+        api_performance,
+        settings,
     )
+    chart_hashrate_points = hashrate_points if settings.get("show_aux_panel", True) else []
+    chart_transaction_points = transaction_points if settings.get("show_aux_panel", True) else []
     chart_png = render_chart(
         candles,
         tickers,
-        hashrate_points,
+        chart_hashrate_points,
         hashrate_ths,
         btc_candles,
-        transaction_points,
+        chart_transaction_points,
         display_dt,
         error_labels,
     )
