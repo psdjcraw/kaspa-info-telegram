@@ -51,6 +51,7 @@ class Ticker:
     futures_quote_volume: float | None = None
     futures_last: float | None = None
     futures_open_interest: float | None = None
+    futures_funding_rate: float | None = None
     futures_only: bool = False
     market_rank_delta: int | None = None
     spot_volume_delta_pct: float | None = None
@@ -120,6 +121,8 @@ def save_state(state: dict[str, Any]) -> None:
     tmp_path = STATE_PATH.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(state, handle, ensure_ascii=False, indent=2)
+    if STATE_PATH.exists():
+        STATE_PATH.with_suffix(".bak").write_bytes(STATE_PATH.read_bytes())
     tmp_path.replace(STATE_PATH)
 
 
@@ -588,6 +591,7 @@ def futures_ticker(
     last: float | None,
     quote_volume: float | None,
     open_interest: float | None = None,
+    funding_rate: float | None = None,
     market_rank: int | None = None,
     price_change_pct: float | None = None,
 ) -> Ticker:
@@ -603,29 +607,35 @@ def futures_ticker(
         futures_quote_volume=quote_volume,
         futures_last=last,
         futures_open_interest=open_interest,
+        futures_funding_rate=funding_rate,
         futures_only=True,
         market_rank=market_rank,
         price_change_pct=price_change_pct,
     )
 
 
-def fetch_gate_futures() -> tuple[float | None, float | None, float | None]:
+def fetch_gate_futures() -> tuple[float | None, float | None, float | None, float | None]:
     payload = http_json("https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=KAS_USDT")
     ticker = payload[0]
     last = as_float(ticker.get("last"))
     total_size = as_float(ticker.get("total_size"))
     multiplier = as_float(ticker.get("quanto_multiplier"))
     open_interest = total_size * multiplier * last if total_size is not None and multiplier is not None and last is not None else None
-    return last, as_float(ticker.get("volume_24h_quote") or ticker.get("volume_24h_settle")), open_interest
+    return (
+        last,
+        as_float(ticker.get("volume_24h_quote") or ticker.get("volume_24h_settle")),
+        open_interest,
+        as_float(ticker.get("funding_rate")),
+    )
 
 
-def fetch_mexc_futures() -> tuple[float | None, float | None, float | None]:
+def fetch_mexc_futures() -> tuple[float | None, float | None, float | None, float | None]:
     payload = http_json("https://contract.mexc.com/api/v1/contract/ticker?symbol=KAS_USDT")
     ticker = payload.get("data", {})
-    return as_float(ticker.get("lastPrice")), as_float(ticker.get("amount24")), None
+    return as_float(ticker.get("lastPrice")), as_float(ticker.get("amount24")), None, as_float(ticker.get("fundingRate"))
 
 
-def fetch_kucoin_futures() -> tuple[float | None, float | None, float | None]:
+def fetch_kucoin_futures() -> tuple[float | None, float | None, float | None, float | None]:
     payload = http_json("https://api-futures.kucoin.com/api/v1/contracts/active")
     for ticker in payload.get("data", []):
         if ticker.get("symbol") == "KASUSDTM":
@@ -637,29 +647,41 @@ def fetch_kucoin_futures() -> tuple[float | None, float | None, float | None]:
                 if open_interest is not None and multiplier is not None and last is not None
                 else None
             )
-            return last, as_float(ticker.get("turnoverOf24h")), open_interest_value
+            return last, as_float(ticker.get("turnoverOf24h")), open_interest_value, as_float(ticker.get("fundingFeeRate"))
     raise RuntimeError("KASUSDTM not found")
 
 
-def fetch_bybit_futures() -> tuple[float | None, float | None, float | None]:
+def fetch_bybit_futures() -> tuple[float | None, float | None, float | None, float | None]:
     payload = http_json("https://api.bybit.com/v5/market/tickers?category=linear&symbol=KASUSDT")
     ticker = payload.get("result", {}).get("list", [{}])[0]
-    return as_float(ticker.get("lastPrice")), as_float(ticker.get("turnover24h")), as_float(ticker.get("openInterestValue"))
+    return (
+        as_float(ticker.get("lastPrice")),
+        as_float(ticker.get("turnover24h")),
+        as_float(ticker.get("openInterestValue")),
+        as_float(ticker.get("fundingRate")),
+    )
 
 
-def fetch_bitget_futures() -> tuple[float | None, float | None, float | None]:
+def fetch_bitget_futures() -> tuple[float | None, float | None, float | None, float | None]:
     payload = http_json("https://api.bitget.com/api/v2/mix/market/ticker?symbol=KASUSDT&productType=USDT-FUTURES")
     ticker = payload.get("data", [{}])[0]
     mark_price = as_float(ticker.get("markPrice") or ticker.get("lastPr"))
     holding_amount = as_float(ticker.get("holdingAmount"))
     open_interest = holding_amount * mark_price if holding_amount is not None and mark_price is not None else None
-    return as_float(ticker.get("lastPr")), as_float(ticker.get("quoteVolume") or ticker.get("usdtVolume")), open_interest
+    return (
+        as_float(ticker.get("lastPr")),
+        as_float(ticker.get("quoteVolume") or ticker.get("usdtVolume")),
+        open_interest,
+        as_float(ticker.get("fundingRate")),
+    )
 
 
-def fetch_htx_futures() -> tuple[float | None, float | None, float | None]:
+def fetch_htx_futures() -> tuple[float | None, float | None, float | None, float | None]:
     payload = http_json("https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=KAS-USDT")
     ticker = payload.get("tick", {})
-    return as_float(ticker.get("close")), as_float(ticker.get("trade_turnover")), None
+    funding_payload = http_json("https://api.hbdm.com/linear-swap-api/v1/swap_funding_rate?contract_code=KAS-USDT")
+    funding = as_float((funding_payload.get("data") or {}).get("funding_rate"))
+    return as_float(ticker.get("close")), as_float(ticker.get("trade_turnover")), None, funding
 
 
 def fetch_binance_futures() -> Ticker:
@@ -674,6 +696,7 @@ def fetch_binance_futures() -> Ticker:
     )
     ticker = next((ticker for ticker in payload if ticker.get("symbol") == "KASUSDT"), {})
     open_interest_payload = http_json("https://fapi.binance.com/fapi/v1/openInterest?symbol=KASUSDT")
+    premium_payload = http_json("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=KASUSDT")
     last = as_float(ticker.get("lastPrice"))
     open_interest = as_float(open_interest_payload.get("openInterest"))
     return futures_ticker(
@@ -681,6 +704,7 @@ def fetch_binance_futures() -> Ticker:
         last,
         as_float(ticker.get("quoteVolume")),
         open_interest=open_interest * last if open_interest is not None and last is not None else None,
+        funding_rate=as_float(premium_payload.get("lastFundingRate")),
         market_rank=rank,
         price_change_pct=as_float(ticker.get("priceChangePercent")),
     )
@@ -705,6 +729,7 @@ def fetch_coinbase_futures() -> Ticker:
         last,
         as_float(ticker.get("notional_24hr")),
         open_interest=open_interest * last if open_interest is not None and last is not None else None,
+        funding_rate=None,
         market_rank=rank,
     )
 
@@ -728,6 +753,7 @@ def fetch_echobit_futures() -> Ticker:
         "Echobit",
         as_float(ticker.get("c")),
         as_float(ticker.get("qv")),
+        funding_rate=None,
         market_rank=rank,
         price_change_pct=price_change * 100 if price_change is not None else None,
     )
@@ -755,12 +781,13 @@ def fetch_bitmart_futures() -> Ticker:
         as_float(ticker.get("last_price")),
         as_float(ticker.get("turnover_24h")),
         open_interest=as_float(ticker.get("open_interest_value")),
+        funding_rate=as_float(ticker.get("funding_rate") or ticker.get("expected_funding_rate")),
         market_rank=rank,
         price_change_pct=price_change * 100 if price_change is not None else None,
     )
 
 
-FUTURES_FETCHERS: dict[str, Callable[[], tuple[float | None, float | None, float | None]]] = {
+FUTURES_FETCHERS: dict[str, Callable[[], tuple[float | None, float | None, float | None, float | None]]] = {
     "Gate": fetch_gate_futures,
     "MEXC": fetch_mexc_futures,
     "KuCoin": fetch_kucoin_futures,
@@ -822,10 +849,11 @@ def apply_futures_volumes(tickers: list[Ticker]) -> None:
         if not fetcher:
             continue
         try:
-            futures_last, futures_volume, open_interest = fetcher()
+            futures_last, futures_volume, open_interest, funding_rate = fetcher()
             ticker.futures_last = futures_last
             ticker.futures_quote_volume = futures_volume
             ticker.futures_open_interest = open_interest
+            ticker.futures_funding_rate = funding_rate
         except Exception as exc:
             ticker.error = ticker.error or f"futures: {str(exc)[:80]}"
 
@@ -1077,7 +1105,7 @@ def quote_volume_millions(value: float | None) -> str:
     return f"{value / 1_000_000:.2f}M"
 
 
-def delta_suffix(value: float | None, threshold: float = 0.5) -> str:
+def delta_suffix(value: float | None, threshold: float = 2.0) -> str:
     if value is None or abs(value) < threshold:
         return ""
     return f"{value:+.0f}%"
@@ -1227,6 +1255,12 @@ def market_open_interest(ticker: Ticker) -> str:
     return volume_with_delta(ticker.futures_open_interest, ticker.open_interest_delta_pct)
 
 
+def market_funding(ticker: Ticker) -> str:
+    if not ticker.ok or ticker.futures_funding_rate is None:
+        return "-"
+    return f"{ticker.futures_funding_rate * 100:+.3f}%"
+
+
 def market_rank(ticker: Ticker) -> str:
     if not ticker.ok or ticker.market_rank is None:
         return "-"
@@ -1296,6 +1330,16 @@ def open_interest_summary(tickers: list[Ticker]) -> tuple[float, Ticker | None]:
     return total, top
 
 
+def funding_summary(tickers: list[Ticker]) -> tuple[float | None, Ticker | None, Ticker | None]:
+    futures = [ticker for ticker in tickers if ticker.ok and ticker.futures_funding_rate is not None]
+    if not futures:
+        return None, None, None
+    average = sum(float(ticker.futures_funding_rate or 0) for ticker in futures) / len(futures)
+    highest = max(futures, key=lambda ticker: ticker.futures_funding_rate or 0, default=None)
+    lowest = min(futures, key=lambda ticker: ticker.futures_funding_rate or 0, default=None)
+    return average, highest, lowest
+
+
 def caption_futures_summary(tickers: list[Ticker]) -> str | None:
     total, top = futures_summary(tickers)
     if total <= 0 or top is None:
@@ -1310,6 +1354,13 @@ def caption_open_interest_summary(tickers: list[Ticker]) -> str | None:
     return f"{quote_volume_millions(total)} top {caption_exchange(top.exchange)}"
 
 
+def caption_funding_summary(tickers: list[Ticker]) -> str | None:
+    average, highest, lowest = funding_summary(tickers)
+    if average is None:
+        return None
+    return f"avg {average * 100:+.3f}%"
+
+
 def kimchi_premium(avg_usdt: float | None, coinone: Ticker | None, usdt_krw: float | None) -> float | None:
     if not avg_usdt or not coinone or not usdt_krw:
         return None
@@ -1317,6 +1368,23 @@ def kimchi_premium(avg_usdt: float | None, coinone: Ticker | None, usdt_krw: flo
     if fair_krw <= 0:
         return None
     return ((coinone.last - fair_krw) / fair_krw) * 100
+
+
+def futures_basis(avg_usdt: float | None, tickers: list[Ticker]) -> float | None:
+    basis_values = []
+    for ticker in tickers:
+        if not ticker.ok or ticker.futures_last is None or ticker.futures_last <= 0:
+            continue
+        spot_reference = None
+        if not ticker.futures_only and ticker.unit in {"USDT", "USD"} and ticker.last > 0:
+            spot_reference = ticker.last
+        elif avg_usdt:
+            spot_reference = avg_usdt
+        if spot_reference:
+            basis_values.append(((ticker.futures_last - spot_reference) / spot_reference) * 100)
+    if not basis_values:
+        return None
+    return sum(basis_values) / len(basis_values)
 
 
 def interest_score(tickers: list[Ticker]) -> float:
@@ -1332,10 +1400,12 @@ def interest_score(tickers: list[Ticker]) -> float:
             score += max(-2.0, min(2.0, ticker.futures_volume_delta_pct / 5))
         if ticker.open_interest_delta_pct:
             score += max(-1.5, min(1.5, ticker.open_interest_delta_pct / 5))
+        if ticker.futures_funding_rate:
+            score += max(-1.0, min(1.0, ticker.futures_funding_rate * 4000))
     return score
 
 
-def caption_alerts(tickers: list[Ticker], premium: float | None) -> str | None:
+def caption_alerts(tickers: list[Ticker], premium: float | None, basis: float | None) -> str | None:
     alerts = []
     for ticker in tickers:
         if ticker.market_rank_delta is not None and ticker.market_rank_delta >= 5:
@@ -1349,6 +1419,8 @@ def caption_alerts(tickers: list[Ticker], premium: float | None) -> str | None:
         alerts.append(f"FutVol +{top_futures_delta:.0f}%")
     if premium is not None and abs(premium) >= 1.0:
         alerts.append(f"Kimchi {premium:+.1f}%")
+    if basis is not None and abs(basis) >= 0.25:
+        alerts.append(f"Basis {basis:+.2f}%")
     if not alerts:
         return None
     return " / ".join(alerts[:2])
@@ -1365,6 +1437,43 @@ def api_error_labels(tickers: list[Ticker], extra_errors: list[str] | None = Non
         if label not in deduped:
             deduped.append(label)
     return deduped
+
+
+def update_api_status(state: dict[str, Any], tickers: list[Ticker], extra_errors: list[str] | None = None) -> list[str]:
+    now = int(time.time())
+    status = state.setdefault("api_status", {})
+    errors = set(api_error_labels(tickers, extra_errors))
+    observed = {ticker.exchange for ticker in tickers}
+    observed.update({"USDT/KRW", "F&G", "Ranks", "Hashrate", "TX", "Candles", "BTC"})
+    for label in sorted(observed):
+        item = status.setdefault(label, {})
+        if label in errors:
+            item["last_error"] = now
+            item["failures"] = int(item.get("failures", 0)) + 1
+        else:
+            item["last_ok"] = now
+            item["failures"] = 0
+    return sorted(errors)
+
+
+def data_status_text(state: dict[str, Any], error_labels: list[str]) -> str:
+    if error_labels:
+        text = "miss " + ",".join(error_labels[:4])
+        if len(error_labels) > 4:
+            text += f"+{len(error_labels) - 4}"
+        return text
+    status = state.get("api_status", {})
+    stale = []
+    now = int(time.time())
+    for label, item in status.items():
+        if not isinstance(item, dict):
+            continue
+        last_ok = int(item.get("last_ok", 0) or 0)
+        if last_ok and now - last_ok > 15 * 60:
+            stale.append(label)
+    if stale:
+        return "stale " + ",".join(sorted(stale)[:3])
+    return "fresh; cache <=5m"
 
 
 def caption_change(value: float | None) -> str:
@@ -1412,6 +1521,7 @@ def render_caption(
     usdt_krw: float | None = None,
     fear_greed: FearGreedIndex | None = None,
     global_ranks: GlobalRanks | None = None,
+    data_status: str | None = None,
 ) -> str:
     display_dt = display_dt or datetime.now(KST).replace(second=0, microsecond=0)
     now = display_dt.strftime("%Y-%m-%d %H:%M:%S KST")
@@ -1420,6 +1530,7 @@ def render_caption(
     avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
     coinone = next((ticker for ticker in ok_tickers if ticker.exchange == "Coinone"), None)
     premium = kimchi_premium(avg_usdt, coinone, usdt_krw)
+    basis = futures_basis(avg_usdt, tickers)
 
     summary_rows = []
     if avg_usdt:
@@ -1432,6 +1543,8 @@ def render_caption(
         summary_rows.append(caption_summary_row("USDT/KRW", f"{usdt_krw:,.2f} KRW"))
     if premium is not None:
         summary_rows.append(caption_summary_row("Kimchi", f"{premium:+.2f}%"))
+    if basis is not None:
+        summary_rows.append(caption_summary_row("Basis", f"{basis:+.2f}%"))
     if fear_greed is not None:
         summary_rows.append(caption_summary_row("F&G", fmt_fear_greed(fear_greed)))
     if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
@@ -1442,10 +1555,15 @@ def render_caption(
     oi_caption = caption_open_interest_summary(tickers)
     if oi_caption:
         summary_rows.append(caption_summary_row("OI", oi_caption))
+    funding_caption = caption_funding_summary(tickers)
+    if funding_caption:
+        summary_rows.append(caption_summary_row("Funding", funding_caption))
     summary_rows.append(caption_summary_row("Interest", f"{interest_score(tickers):+.1f}"))
-    alerts = caption_alerts(tickers, premium)
+    alerts = caption_alerts(tickers, premium, basis)
     if alerts:
         summary_rows.append(caption_summary_row("Alerts", alerts))
+    if data_status:
+        summary_rows.append(caption_summary_row("Data", data_status))
     summary_rows.append(caption_summary_row("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
         summary_rows.append(caption_summary_row("Hashrate", fmt_hashrate(hashrate_ths)))
@@ -1709,10 +1827,11 @@ def render_chart(
     rank_right_x = 330
     price_right_x = 520
     price_change_right_x = 660
-    volume_right_x = 900
-    change_right_x = 1040
-    futures_volume_right_x = 1285
-    open_interest_right_x = 1516
+    volume_right_x = 875
+    change_right_x = 1010
+    futures_volume_right_x = 1195
+    open_interest_right_x = 1370
+    funding_right_x = 1516
     draw.text((exchange_x, header_y), "Exchange", fill="#9aa4b2", font=small_font)
     draw_right(rank_right_x, header_y, "Mkt Rank", "#9aa4b2", small_font)
     draw_right(price_right_x, header_y, "Price", "#9aa4b2", small_font)
@@ -1721,6 +1840,7 @@ def render_chart(
     draw_right(change_right_x, header_y, "S24h", "#9aa4b2", small_font)
     draw_right(futures_volume_right_x, header_y, "Fut $", "#9aa4b2", small_font)
     draw_right(open_interest_right_x, header_y, "OI $", "#9aa4b2", small_font)
+    draw_right(funding_right_x, header_y, "Fund", "#9aa4b2", small_font)
     draw.line((84, header_y + 32, 1516, header_y + 32), fill="#2b3342", width=1)
 
     y = 678
@@ -1750,6 +1870,7 @@ def render_chart(
         draw_right(change_right_x, y + 3, volume_change_value(ticker), volume_change_color(ticker), row_font)
         draw_right(futures_volume_right_x, y + 3, market_futures_volume(ticker), "#f3f6fb", row_font)
         draw_right(open_interest_right_x, y + 3, market_open_interest(ticker), "#f3f6fb", row_font)
+        draw_right(funding_right_x, y + 3, market_funding(ticker), change_color(ticker.futures_funding_rate), row_font)
         y += row_height
 
     draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
@@ -1764,7 +1885,7 @@ def render_chart(
             error_text += f" +{len(api_errors) - 6}"
         draw.text((84, height - 34), error_text, fill="#ff9f43", font=small_font)
     else:
-        draw.text((84, height - 34), "Data: fresh; rank cache <=5m", fill="#6f7b8f", font=small_font)
+        draw.text((84, height - 34), "Data: fresh; cache <=5m", fill="#6f7b8f", font=small_font)
 
     if IMAGE_SCALE != 1:
         image = image.resize((int(width * IMAGE_SCALE), int(height * IMAGE_SCALE)), Image.Resampling.LANCZOS)
@@ -1903,7 +2024,6 @@ def run_once(dry_run: bool = False) -> None:
     except Exception as exc:
         print(f"transactions fallback: {exc}")
         run_errors.append("TX")
-    caption = render_caption(tickers, hashrate_ths, display_dt, usdt_krw, fear_greed, global_ranks)
     try:
         candles = fetch_gate_candles()
     except Exception as exc:
@@ -1916,6 +2036,17 @@ def run_once(dry_run: bool = False) -> None:
     except Exception as exc:
         print(f"btc fallback: {exc}")
         run_errors.append("BTC")
+    error_labels = update_api_status(state, tickers, run_errors)
+    status_text = data_status_text(state, error_labels)
+    caption = render_caption(
+        tickers,
+        hashrate_ths,
+        display_dt,
+        usdt_krw,
+        fear_greed,
+        global_ranks,
+        status_text,
+    )
     chart_png = render_chart(
         candles,
         tickers,
@@ -1924,7 +2055,7 @@ def run_once(dry_run: bool = False) -> None:
         btc_candles,
         transaction_points,
         display_dt,
-        api_error_labels(tickers, run_errors),
+        error_labels,
     )
     CHART_PATH.write_bytes(chart_png)
 

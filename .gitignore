@@ -1,5 +1,6 @@
 .env
 state.json
+state.bak
 kaspa-chart.png
 ticker.log
 ticker.err.log
