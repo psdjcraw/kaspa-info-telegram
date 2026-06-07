@@ -106,6 +106,13 @@ class GlobalRanks:
     coingecko: int | None = None
 
 
+@dataclass
+class MarketDominance:
+    bitcoin: float | None = None
+    ethereum: float | None = None
+    alt_ex_btc_eth: float | None = None
+
+
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -274,6 +281,15 @@ def fetch_global_ranks() -> GlobalRanks:
     return ranks
 
 
+def fetch_market_dominance() -> MarketDominance:
+    payload = http_json("https://api.coingecko.com/api/v3/global")
+    percentages = payload.get("data", {}).get("market_cap_percentage", {})
+    btc = as_float(percentages.get("btc"))
+    eth = as_float(percentages.get("eth"))
+    alt = 100 - btc - eth if btc is not None and eth is not None else None
+    return MarketDominance(bitcoin=btc, ethereum=eth, alt_ex_btc_eth=alt)
+
+
 def fetch_fear_greed_index_cached(state: dict[str, Any]) -> FearGreedIndex:
     def fetch() -> dict[str, Any]:
         index = fetch_fear_greed_index()
@@ -302,6 +318,28 @@ def fetch_global_ranks_cached(state: dict[str, Any]) -> GlobalRanks:
     return GlobalRanks(
         coinmarketcap=value.get("coinmarketcap"),
         coingecko=value.get("coingecko"),
+    )
+
+
+def fetch_market_dominance_cached(state: dict[str, Any]) -> MarketDominance:
+    def fetch() -> dict[str, Any]:
+        dominance = fetch_market_dominance()
+        return {
+            "bitcoin": dominance.bitcoin,
+            "ethereum": dominance.ethereum,
+            "alt_ex_btc_eth": dominance.alt_ex_btc_eth,
+        }
+
+    value = cached_value(
+        state,
+        "market_dominance",
+        SLOW_INDEX_CACHE_SECONDS,
+        fetch,
+    )
+    return MarketDominance(
+        bitcoin=value.get("bitcoin"),
+        ethereum=value.get("ethereum"),
+        alt_ex_btc_eth=value.get("alt_ex_btc_eth"),
     )
 
 
@@ -1206,6 +1244,15 @@ def fmt_global_ranks(ranks: GlobalRanks | None) -> str:
     return f"CMC {cmc} / CG {cg}"
 
 
+def fmt_market_dominance(dominance: MarketDominance | None) -> str:
+    if dominance is None:
+        return "-"
+    btc = f"{dominance.bitcoin:.1f}" if dominance.bitcoin is not None else "-"
+    eth = f"{dominance.ethereum:.1f}" if dominance.ethereum is not None else "-"
+    alt = f"{dominance.alt_ex_btc_eth:.1f}" if dominance.alt_ex_btc_eth is not None else "-"
+    return f"B {btc} E {eth} A {alt}%"
+
+
 def quote_volume_value(ticker: Ticker) -> float | None:
     if ticker.quote_volume is not None:
         return ticker.quote_volume
@@ -1526,7 +1573,7 @@ def update_api_status(state: dict[str, Any], tickers: list[Ticker], extra_errors
     status = state.setdefault("api_status", {})
     errors = set(api_error_labels(tickers, extra_errors))
     observed = {ticker.exchange for ticker in tickers}
-    observed.update({"USDT/KRW", "F&G", "Ranks", "Hashrate", "TX", "Candles", "BTC"})
+    observed.update({"USDT/KRW", "F&G", "Ranks", "Dominance", "Hashrate", "TX", "Candles", "BTC"})
     for label in sorted(observed):
         item = status.setdefault(label, {})
         if label in errors:
@@ -1629,6 +1676,7 @@ def render_caption(
     usdt_krw: float | None = None,
     fear_greed: FearGreedIndex | None = None,
     global_ranks: GlobalRanks | None = None,
+    market_dominance: MarketDominance | None = None,
     data_status: str | None = None,
     api_performance: dict[str, Any] | None = None,
     settings: dict[str, Any] | None = None,
@@ -1662,6 +1710,8 @@ def render_caption(
         summary_rows.append(caption_summary_row("F&G", fmt_fear_greed(fear_greed)))
     if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
         summary_rows.append(caption_summary_row("Ranks", fmt_global_ranks(global_ranks)))
+    if market_dominance is not None:
+        summary_rows.append(caption_summary_row("Dominance", fmt_market_dominance(market_dominance)))
     futures_caption = caption_futures_summary(tickers)
     if futures_caption:
         summary_rows.append(caption_summary_row("Fut Vol", futures_caption))
@@ -2173,6 +2223,7 @@ def run_once(dry_run: bool = False) -> None:
     usdt_krw = None
     fear_greed = None
     global_ranks = None
+    market_dominance = None
     hashrate_points: list[HashratePoint] = []
     transaction_points: list[TransactionPoint] = []
     try:
@@ -2190,6 +2241,11 @@ def run_once(dry_run: bool = False) -> None:
     except Exception as exc:
         print(f"global ranks fallback: {exc}")
         run_errors.append("Ranks")
+    try:
+        market_dominance = fetch_market_dominance_cached(state)
+    except Exception as exc:
+        print(f"market dominance fallback: {exc}")
+        run_errors.append("Dominance")
     try:
         hashrate_ths = fetch_hashrate()
         hashrate_points = fetch_hashrate_history()
@@ -2223,6 +2279,7 @@ def run_once(dry_run: bool = False) -> None:
         usdt_krw,
         fear_greed,
         global_ranks,
+        market_dominance,
         status_text,
         api_performance,
         settings,
