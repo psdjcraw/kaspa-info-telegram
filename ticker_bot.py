@@ -6,8 +6,10 @@ import html
 import io
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +27,8 @@ STATE_PATH = ROOT / "state.json"
 CHART_PATH = ROOT / "kaspa-chart.png"
 KST = timezone(timedelta(hours=9))
 IMAGE_SCALE = 1.3
+TRANSACTION_BUCKET_SECONDS = 5 * 60
+TOCATA_HARDFORK_AT = datetime(2026, 6, 30, 16, 15, tzinfo=timezone.utc)
 
 
 @dataclass
@@ -41,6 +45,10 @@ class Ticker:
     error: str = ""
     volume_change_pct: float | None = None
     price_change_pct: float | None = None
+    market_rank: int | None = None
+    futures_quote_volume: float | None = None
+    futures_last: float | None = None
+    futures_only: bool = False
 
 
 @dataclass
@@ -69,6 +77,18 @@ class TransactionPoint:
 class MarketHistoryStats:
     previous_volume: float | None
     previous_close: float | None
+
+
+@dataclass
+class FearGreedIndex:
+    value: int
+    classification: str
+
+
+@dataclass
+class GlobalRanks:
+    coinmarketcap: int | None = None
+    coingecko: int | None = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -132,6 +152,75 @@ def fetch_coinone() -> Ticker:
         quote_volume=as_float(ticker.get("quote_volume")),
         unit="KRW",
     )
+
+
+def fetch_usdt_krw() -> float:
+    payload = http_json("https://api.coinone.co.kr/public/v2/ticker_new/KRW/USDT")
+    ticker = payload["tickers"][0]
+    return float(ticker["last"])
+
+
+def fetch_fear_greed_index() -> FearGreedIndex:
+    payload = http_json("https://api.alternative.me/fng/?limit=1&format=json")
+    rows = payload.get("data") or []
+    if not rows:
+        raise RuntimeError("fear greed data missing")
+    row = rows[0]
+    return FearGreedIndex(
+        value=int(row["value"]),
+        classification=str(row.get("value_classification") or ""),
+    )
+
+
+def fetch_coinmarketcap_rank() -> int:
+    api_key = env("CMC_API_KEY") or env("COINMARKETCAP_API_KEY")
+    if api_key:
+        request = urllib.request.Request(
+            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=KAS",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "kaspa-info-telegram/1.0",
+                "X-CMC_PRO_API_KEY": api_key,
+            },
+        )
+        with urllib.request.urlopen(request, timeout=8.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return int(payload["data"]["KAS"]["cmc_rank"])
+
+    request = urllib.request.Request(
+        "https://coinmarketcap.com/currencies/kaspa/",
+        headers={
+            "Accept": "text/html",
+            "User-Agent": "Mozilla/5.0 kaspa-info-telegram/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=12.0) as response:
+        body = response.read().decode("utf-8", errors="replace")
+    match = re.search(r'"rank":(\d+)', body)
+    if not match:
+        raise RuntimeError("coinmarketcap rank missing")
+    return int(match.group(1))
+
+
+def fetch_coingecko_rank() -> int:
+    payload = http_json(
+        "https://api.coingecko.com/api/v3/coins/kaspa?"
+        "localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false"
+    )
+    return int(payload["market_cap_rank"])
+
+
+def fetch_global_ranks() -> GlobalRanks:
+    ranks = GlobalRanks()
+    try:
+        ranks.coinmarketcap = fetch_coinmarketcap_rank()
+    except Exception as exc:
+        print(f"coinmarketcap rank fallback: {exc}")
+    try:
+        ranks.coingecko = fetch_coingecko_rank()
+    except Exception as exc:
+        print(f"coingecko rank fallback: {exc}")
+    return ranks
 
 
 def fetch_gate() -> Ticker:
@@ -211,14 +300,16 @@ def fetch_bitget() -> Ticker:
 def fetch_kraken() -> Ticker:
     payload = http_json("https://api.kraken.com/0/public/Ticker?pair=KASUSD")
     ticker = payload["result"]["KASUSD"]
+    last = float(ticker["c"][0])
+    base_volume = as_float(ticker["v"][1])
     return Ticker(
         exchange="Kraken",
         pair="KAS/USD",
-        last=float(ticker["c"][0]),
+        last=last,
         bid=as_float(ticker["b"][0]),
         ask=as_float(ticker["a"][0]),
-        base_volume=as_float(ticker["v"][1]),
-        quote_volume=None,
+        base_volume=base_volume,
+        quote_volume=base_volume * last if base_volume is not None else None,
         unit="USD",
     )
 
@@ -270,12 +361,12 @@ def fetch_gate_market_history() -> MarketHistoryStats:
         "https://api.gateio.ws/api/v4/spot/candlesticks?"
         "currency_pair=KAS_USDT&interval=1h&limit=48"
     )
-    return previous_market_stats([(int(row[0]), float(row[2]), float(row[6])) for row in payload])
+    return previous_market_stats([(int(row[0]), float(row[2]), float(row[1])) for row in payload])
 
 
 def fetch_mexc_market_history() -> MarketHistoryStats:
     payload = http_json("https://api.mexc.com/api/v3/klines?symbol=KASUSDT&interval=60m&limit=48")
-    return previous_market_stats([(int(int(row[0]) / 1000), float(row[4]), float(row[5])) for row in payload])
+    return previous_market_stats([(int(int(row[0]) / 1000), float(row[4]), float(row[7])) for row in payload])
 
 
 def fetch_kucoin_market_history() -> MarketHistoryStats:
@@ -284,30 +375,30 @@ def fetch_kucoin_market_history() -> MarketHistoryStats:
         "https://api.kucoin.com/api/v1/market/candles?"
         f"symbol=KAS-USDT&type=1hour&startAt={now - 49 * 60 * 60}&endAt={now}"
     )
-    return previous_market_stats([(int(row[0]), float(row[2]), float(row[5])) for row in payload["data"]])
+    return previous_market_stats([(int(row[0]), float(row[2]), float(row[6])) for row in payload["data"]])
 
 
 def fetch_bybit_market_history() -> MarketHistoryStats:
     payload = http_json("https://api.bybit.com/v5/market/kline?category=spot&symbol=KASUSDT&interval=60&limit=48")
     rows = payload["result"]["list"]
-    return previous_market_stats([(int(int(row[0]) / 1000), float(row[4]), float(row[5])) for row in rows])
+    return previous_market_stats([(int(int(row[0]) / 1000), float(row[4]), float(row[6])) for row in rows])
 
 
 def fetch_bitget_market_history() -> MarketHistoryStats:
     payload = http_json("https://api.bitget.com/api/v2/spot/market/candles?symbol=KASUSDT&granularity=1h&limit=48")
-    return previous_market_stats([(int(int(row[0]) / 1000), float(row[4]), float(row[5])) for row in payload["data"]])
+    return previous_market_stats([(int(int(row[0]) / 1000), float(row[4]), float(row[6])) for row in payload["data"]])
 
 
 def fetch_kraken_market_history() -> MarketHistoryStats:
     since = int(time.time()) - 49 * 60 * 60
     payload = http_json(f"https://api.kraken.com/0/public/OHLC?pair=KASUSD&interval=60&since={since}")
     rows = payload["result"].get("KASUSD", [])
-    return previous_market_stats([(int(row[0]), float(row[4]), float(row[6])) for row in rows])
+    return previous_market_stats([(int(row[0]), float(row[4]), float(row[6]) * float(row[4])) for row in rows])
 
 
 def fetch_htx_market_history() -> MarketHistoryStats:
     payload = http_json("https://api.huobi.pro/market/history/kline?symbol=kasusdt&period=60min&size=48")
-    return previous_market_stats([(int(row["id"]), float(row["close"]), float(row["amount"])) for row in payload["data"]])
+    return previous_market_stats([(int(row["id"]), float(row["close"]), float(row["vol"])) for row in payload["data"]])
 
 
 MARKET_HISTORY_FETCHERS: dict[str, Callable[[], MarketHistoryStats]] = {
@@ -321,6 +412,293 @@ MARKET_HISTORY_FETCHERS: dict[str, Callable[[], MarketHistoryStats]] = {
 }
 
 
+def rank_symbol_by_volume(
+    rows: list[tuple[str, float | None]],
+    target_symbol: str,
+) -> int | None:
+    volumes = [(symbol, volume) for symbol, volume in rows if volume is not None]
+    if not volumes:
+        return None
+    ranked = sorted(volumes, key=lambda item: item[1], reverse=True)
+    for index, (symbol, _) in enumerate(ranked, start=1):
+        if symbol == target_symbol:
+            return index
+    return None
+
+
+def fetch_gate_market_rank() -> int | None:
+    payload = http_json("https://api.gateio.ws/api/v4/spot/tickers")
+    return rank_symbol_by_volume(
+        [
+            (row.get("currency_pair", ""), as_float(row.get("quote_volume")))
+            for row in payload
+            if str(row.get("currency_pair", "")).endswith("_USDT")
+        ],
+        "KAS_USDT",
+    )
+
+
+def fetch_mexc_market_rank() -> int | None:
+    payload = http_json("https://api.mexc.com/api/v3/ticker/24hr")
+    return rank_symbol_by_volume(
+        [
+            (row.get("symbol", ""), as_float(row.get("quoteVolume")))
+            for row in payload
+            if str(row.get("symbol", "")).endswith("USDT")
+        ],
+        "KASUSDT",
+    )
+
+
+def fetch_kucoin_market_rank() -> int | None:
+    payload = http_json("https://api.kucoin.com/api/v1/market/allTickers")
+    rows = payload.get("data", {}).get("ticker", [])
+    return rank_symbol_by_volume(
+        [
+            (row.get("symbol", ""), as_float(row.get("volValue")))
+            for row in rows
+            if str(row.get("symbol", "")).endswith("-USDT")
+        ],
+        "KAS-USDT",
+    )
+
+
+def fetch_bybit_market_rank() -> int | None:
+    payload = http_json("https://api.bybit.com/v5/market/tickers?category=spot")
+    rows = payload.get("result", {}).get("list", [])
+    return rank_symbol_by_volume(
+        [
+            (row.get("symbol", ""), as_float(row.get("turnover24h")))
+            for row in rows
+            if str(row.get("symbol", "")).endswith("USDT")
+        ],
+        "KASUSDT",
+    )
+
+
+def fetch_bitget_market_rank() -> int | None:
+    payload = http_json("https://api.bitget.com/api/v2/spot/market/tickers")
+    rows = payload.get("data", [])
+    return rank_symbol_by_volume(
+        [
+            (row.get("symbol", ""), as_float(row.get("quoteVolume") or row.get("usdtVolume")))
+            for row in rows
+            if str(row.get("symbol", "")).endswith("USDT")
+        ],
+        "KASUSDT",
+    )
+
+
+def fetch_kraken_market_rank() -> int | None:
+    pairs_payload = http_json("https://api.kraken.com/0/public/AssetPairs")
+    ticker_payload = http_json("https://api.kraken.com/0/public/Ticker")
+    tickers = ticker_payload.get("result", {})
+    rows = []
+    for pair_key, pair in pairs_payload.get("result", {}).items():
+        if not str(pair.get("wsname", "")).endswith("/USD"):
+            continue
+        ticker = tickers.get(pair_key)
+        if not ticker:
+            continue
+        last = as_float((ticker.get("c") or [None])[0])
+        base_volume = as_float((ticker.get("v") or [None, None])[1])
+        rows.append((pair_key, base_volume * last if base_volume is not None and last is not None else None))
+    return rank_symbol_by_volume(rows, "KASUSD")
+
+
+def fetch_htx_market_rank() -> int | None:
+    payload = http_json("https://api.huobi.pro/market/tickers")
+    return rank_symbol_by_volume(
+        [
+            (row.get("symbol", ""), as_float(row.get("vol")))
+            for row in payload.get("data", [])
+            if str(row.get("symbol", "")).endswith("usdt")
+        ],
+        "kasusdt",
+    )
+
+
+MARKET_RANK_FETCHERS: dict[str, Callable[[], int | None]] = {
+    "Gate": fetch_gate_market_rank,
+    "MEXC": fetch_mexc_market_rank,
+    "KuCoin": fetch_kucoin_market_rank,
+    "Bybit": fetch_bybit_market_rank,
+    "Bitget": fetch_bitget_market_rank,
+    "Kraken": fetch_kraken_market_rank,
+    "HTX": fetch_htx_market_rank,
+}
+
+
+def futures_ticker(
+    exchange: str,
+    last: float | None,
+    quote_volume: float | None,
+    market_rank: int | None = None,
+    price_change_pct: float | None = None,
+) -> Ticker:
+    return Ticker(
+        exchange=exchange,
+        pair="KAS/USDT PERP",
+        last=last or 0.0,
+        bid=None,
+        ask=None,
+        base_volume=None,
+        quote_volume=None,
+        unit="USDT",
+        futures_quote_volume=quote_volume,
+        futures_last=last,
+        futures_only=True,
+        market_rank=market_rank,
+        price_change_pct=price_change_pct,
+    )
+
+
+def fetch_gate_futures() -> tuple[float | None, float | None]:
+    payload = http_json("https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=KAS_USDT")
+    ticker = payload[0]
+    return as_float(ticker.get("last")), as_float(ticker.get("volume_24h_quote") or ticker.get("volume_24h_settle"))
+
+
+def fetch_mexc_futures() -> tuple[float | None, float | None]:
+    payload = http_json("https://contract.mexc.com/api/v1/contract/ticker?symbol=KAS_USDT")
+    ticker = payload.get("data", {})
+    return as_float(ticker.get("lastPrice")), as_float(ticker.get("amount24"))
+
+
+def fetch_kucoin_futures() -> tuple[float | None, float | None]:
+    payload = http_json("https://api-futures.kucoin.com/api/v1/contracts/active")
+    for ticker in payload.get("data", []):
+        if ticker.get("symbol") == "KASUSDTM":
+            return as_float(ticker.get("lastTradePrice")), as_float(ticker.get("turnoverOf24h"))
+    raise RuntimeError("KASUSDTM not found")
+
+
+def fetch_bybit_futures() -> tuple[float | None, float | None]:
+    payload = http_json("https://api.bybit.com/v5/market/tickers?category=linear&symbol=KASUSDT")
+    ticker = payload.get("result", {}).get("list", [{}])[0]
+    return as_float(ticker.get("lastPrice")), as_float(ticker.get("turnover24h"))
+
+
+def fetch_bitget_futures() -> tuple[float | None, float | None]:
+    payload = http_json("https://api.bitget.com/api/v2/mix/market/ticker?symbol=KASUSDT&productType=USDT-FUTURES")
+    ticker = payload.get("data", [{}])[0]
+    return as_float(ticker.get("lastPr")), as_float(ticker.get("quoteVolume") or ticker.get("usdtVolume"))
+
+
+def fetch_htx_futures() -> tuple[float | None, float | None]:
+    payload = http_json("https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code=KAS-USDT")
+    ticker = payload.get("tick", {})
+    return as_float(ticker.get("close")), as_float(ticker.get("trade_turnover"))
+
+
+def fetch_binance_futures() -> Ticker:
+    payload = http_json("https://fapi.binance.com/fapi/v1/ticker/24hr")
+    rank = rank_symbol_by_volume(
+        [
+            (ticker.get("symbol", ""), as_float(ticker.get("quoteVolume")))
+            for ticker in payload
+            if str(ticker.get("symbol", "")).endswith("USDT")
+        ],
+        "KASUSDT",
+    )
+    ticker = next((ticker for ticker in payload if ticker.get("symbol") == "KASUSDT"), {})
+    return futures_ticker(
+        "Binance",
+        as_float(ticker.get("lastPrice")),
+        as_float(ticker.get("quoteVolume")),
+        market_rank=rank,
+        price_change_pct=as_float(ticker.get("priceChangePercent")),
+    )
+
+
+def fetch_coinbase_futures() -> Ticker:
+    payload = http_json("https://api.international.coinbase.com/api/v1/instruments")
+    rank = rank_symbol_by_volume(
+        [
+            (ticker.get("symbol", ""), as_float(ticker.get("notional_24hr")))
+            for ticker in payload
+            if ticker.get("type") == "PERP"
+        ],
+        "KAS-PERP",
+    )
+    ticker = next((ticker for ticker in payload if ticker.get("symbol") == "KAS-PERP"), {})
+    quote = ticker.get("quote") or {}
+    return futures_ticker(
+        "Coinbase",
+        as_float(quote.get("best_ask_price") or quote.get("best_bid_price") or ticker.get("reference_price")),
+        as_float(ticker.get("notional_24hr")),
+        market_rank=rank,
+    )
+
+
+def fetch_echobit_futures() -> Ticker:
+    payload = http_json("https://www.echobit.com/mainapi/exchange/all/tickers")
+    rows = payload.get("data", [])
+    rank = rank_symbol_by_volume(
+        [
+            (ticker.get("s", ""), as_float(ticker.get("qv")))
+            for ticker in rows
+            if str(ticker.get("s", "")).endswith("-SWAP-USDT")
+        ],
+        "KAS-SWAP-USDT",
+    )
+    ticker = next((ticker for ticker in rows if ticker.get("s") == "KAS-SWAP-USDT"), {})
+    if not ticker:
+        raise RuntimeError("KAS-SWAP-USDT not found")
+    price_change = as_float(ticker.get("m"))
+    return futures_ticker(
+        "Echobit",
+        as_float(ticker.get("c")),
+        as_float(ticker.get("qv")),
+        market_rank=rank,
+        price_change_pct=price_change * 100 if price_change is not None else None,
+    )
+
+
+def fetch_bitmart_futures() -> Ticker:
+    payload = http_json("https://api-cloud-v2.bitmart.com/contract/public/details")
+    rows = payload.get("data", {}).get("symbols", [])
+    if not rows:
+        raise RuntimeError("KASUSDT not found")
+    rank = rank_symbol_by_volume(
+        [
+            (ticker.get("symbol", ""), as_float(ticker.get("turnover_24h")))
+            for ticker in rows
+            if str(ticker.get("symbol", "")).endswith("USDT")
+        ],
+        "KASUSDT",
+    )
+    ticker = next((ticker for ticker in rows if ticker.get("symbol") == "KASUSDT"), {})
+    if not ticker:
+        raise RuntimeError("KASUSDT not found")
+    price_change = as_float(ticker.get("change_24h"))
+    return futures_ticker(
+        "BitMart",
+        as_float(ticker.get("last_price")),
+        as_float(ticker.get("turnover_24h")),
+        market_rank=rank,
+        price_change_pct=price_change * 100 if price_change is not None else None,
+    )
+
+
+FUTURES_FETCHERS: dict[str, Callable[[], tuple[float | None, float | None]]] = {
+    "Gate": fetch_gate_futures,
+    "MEXC": fetch_mexc_futures,
+    "KuCoin": fetch_kucoin_futures,
+    "Bybit": fetch_bybit_futures,
+    "Bitget": fetch_bitget_futures,
+    "HTX": fetch_htx_futures,
+}
+
+
+FUTURES_ONLY_FETCHERS: list[Callable[[], Ticker]] = [
+    fetch_binance_futures,
+    fetch_coinbase_futures,
+    fetch_echobit_futures,
+    fetch_bitmart_futures,
+]
+
+
 def apply_market_changes(tickers: list[Ticker]) -> None:
     for ticker in tickers:
         if not ticker.ok:
@@ -330,12 +708,59 @@ def apply_market_changes(tickers: list[Ticker]) -> None:
             continue
         try:
             stats = fetcher()
-            if ticker.base_volume is not None and stats.previous_volume:
-                ticker.volume_change_pct = ((ticker.base_volume - stats.previous_volume) / stats.previous_volume) * 100
+            quote_volume = quote_volume_value(ticker)
+            if quote_volume is not None and stats.previous_volume:
+                ticker.volume_change_pct = ((quote_volume - stats.previous_volume) / stats.previous_volume) * 100
             if stats.previous_close:
                 ticker.price_change_pct = ((ticker.last - stats.previous_close) / stats.previous_close) * 100
         except Exception as exc:
             ticker.error = ticker.error or f"market change: {str(exc)[:80]}"
+
+
+def apply_market_ranks(tickers: list[Ticker]) -> None:
+    for ticker in tickers:
+        if not ticker.ok:
+            continue
+        fetcher = MARKET_RANK_FETCHERS.get(ticker.exchange)
+        if not fetcher:
+            continue
+        try:
+            ticker.market_rank = fetcher()
+        except Exception as exc:
+            ticker.error = ticker.error or f"market rank: {str(exc)[:80]}"
+
+
+def apply_futures_volumes(tickers: list[Ticker]) -> None:
+    for ticker in tickers:
+        if not ticker.ok:
+            continue
+        fetcher = FUTURES_FETCHERS.get(ticker.exchange)
+        if not fetcher:
+            continue
+        try:
+            futures_last, futures_volume = fetcher()
+            ticker.futures_last = futures_last
+            ticker.futures_quote_volume = futures_volume
+        except Exception as exc:
+            ticker.error = ticker.error or f"futures: {str(exc)[:80]}"
+
+
+def fetch_futures_only_tickers() -> list[Ticker]:
+    tickers: list[Ticker] = []
+    for fetcher in FUTURES_ONLY_FETCHERS:
+        try:
+            tickers.append(fetcher())
+        except Exception as exc:
+            exchange = fetcher.__name__.replace("fetch_", "").replace("_futures", "").title()
+            tickers.append(
+                futures_ticker(
+                    exchange=exchange,
+                    last=None,
+                    quote_volume=None,
+                )
+            )
+            tickers[-1].error = str(exc)[:120]
+    return tickers
 
 
 def fetch_gate_candles(currency_pair: str = "KAS_USDT", hours: int = 24, interval: str = "5m") -> list[Candle]:
@@ -405,6 +830,68 @@ def fetch_transaction_counts(hours: int = 24) -> list[TransactionPoint]:
     return sorted((point for point in points if point.ts >= cutoff), key=lambda point: point.ts)
 
 
+def fetch_latest_blue_score() -> int:
+    blocks = http_json("https://api.kaspa.org/blocks-from-bluescore?blueScoreLt=999999999999&includeTransactions=false")
+    return max(int(block["header"]["blueScore"]) for block in blocks)
+
+
+def fetch_virtual_chain(blue_score_gte: int) -> list[dict[str, Any]]:
+    return http_json(
+        "https://api.kaspa.org/virtual-chain?"
+        f"blueScoreGte={blue_score_gte}&limit=100&includeCoinbase=false",
+        timeout=20,
+    )
+
+
+def update_transaction_5m_history(state: dict[str, Any], hours: int = 24) -> list[TransactionPoint]:
+    latest_blue_score = fetch_latest_blue_score()
+    last_blue_score = as_float(state.get("last_transaction_blue_score"))
+    if state.get("transaction_source") != "virtual_chain_5m":
+        bucket_counts: dict[int, int] = {}
+        last_blue_score = None
+    else:
+        bucket_counts = {
+            int(point["ts"]): int(point["count"])
+            for point in state.get("transaction_5m_buckets", [])
+            if point.get("ts") is not None and point.get("count") is not None
+        }
+
+    if last_blue_score is None or latest_blue_score - int(last_blue_score) > 6_000:
+        last_blue_score = max(0, latest_blue_score - 3_000)
+
+    start_blue_score = (int(last_blue_score) + 1) // 100 * 100
+    max_seen_blue_score = int(last_blue_score)
+    pages = 0
+    while start_blue_score <= latest_blue_score and pages < 80:
+        for block in fetch_virtual_chain(start_blue_score):
+            blue_score = int(block.get("blue_score") or 0)
+            if blue_score <= int(last_blue_score) or blue_score > latest_blue_score:
+                continue
+            max_seen_blue_score = max(max_seen_blue_score, blue_score)
+            timestamp_ms = block.get("timestamp")
+            if timestamp_ms is None:
+                continue
+            tx_count = sum(1 for tx in block.get("transactions") or [] if tx.get("is_accepted", True))
+            if tx_count <= 0:
+                continue
+            ts = int(int(timestamp_ms) / 1000)
+            bucket_ts = ts - (ts % TRANSACTION_BUCKET_SECONDS)
+            bucket_counts[bucket_ts] = bucket_counts.get(bucket_ts, 0) + tx_count
+        start_blue_score += 100
+        pages += 1
+
+    cutoff = int(time.time()) - hours * 60 * 60
+    points = [
+        {"ts": bucket_ts, "count": count}
+        for bucket_ts, count in sorted(bucket_counts.items())
+        if bucket_ts >= cutoff and count > 0
+    ]
+    state["transaction_source"] = "virtual_chain_5m"
+    state["last_transaction_blue_score"] = max_seen_blue_score
+    state["transaction_5m_buckets"] = points
+    return [TransactionPoint(ts=point["ts"], count=point["count"]) for point in points]
+
+
 def fetch_tickers() -> list[Ticker]:
     tickers: list[Ticker] = []
     for fetcher in FETCHERS:
@@ -426,6 +913,9 @@ def fetch_tickers() -> list[Ticker]:
                 )
             )
     apply_market_changes(tickers)
+    apply_market_ranks(tickers)
+    apply_futures_volumes(tickers)
+    tickers.extend(fetch_futures_only_tickers())
     return tickers
 
 
@@ -441,7 +931,11 @@ def history_as_candles(history: list[dict[str, Any]]) -> list[Candle]:
 
 
 def update_history(state: dict[str, Any], tickers: list[Ticker], max_points: int = 288) -> list[dict[str, Any]]:
-    usd_prices = [ticker.last for ticker in tickers if ticker.ok and ticker.unit in {"USDT", "USD"} and ticker.last > 0]
+    usd_prices = [
+        ticker.last
+        for ticker in tickers
+        if ticker.ok and not ticker.futures_only and ticker.unit in {"USDT", "USD"} and ticker.last > 0
+    ]
     if not usd_prices:
         return state.get("history", [])
 
@@ -488,6 +982,26 @@ def compact_volume(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def quote_volume_millions(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if 0 < value < 1_000:
+        return "<0.001M"
+    if 0 < value < 10_000:
+        return f"{value / 1_000_000:.3f}M"
+    return f"{value / 1_000_000:.2f}M"
+
+
+def compact_count(value: int | float | None) -> str:
+    if value is None:
+        return "-"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 10_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:,.0f}"
+
+
 def fmt_hashrate(ths: float | None) -> str:
     if ths is None:
         return "-"
@@ -504,10 +1018,50 @@ def fmt_btc_price(price: float | None) -> str:
     return f"{price:,.0f} USDT"
 
 
+def fmt_countdown(target: datetime, now: datetime) -> str:
+    remaining_seconds = int((target - now.astimezone(timezone.utc)).total_seconds())
+    if remaining_seconds <= 0:
+        return "started"
+    days, remainder = divmod(remaining_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    return f"D-{days} {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def fmt_fear_greed(index: FearGreedIndex | None) -> str:
+    if index is None:
+        return "-"
+    labels = {
+        "Extreme Fear": "극단공포",
+        "Fear": "공포",
+        "Neutral": "중립",
+        "Greed": "탐욕",
+        "Extreme Greed": "극단탐욕",
+    }
+    classification = labels.get(index.classification, index.classification)
+    return f"{index.value} {classification}".strip()
+
+
+def fmt_global_ranks(ranks: GlobalRanks | None) -> str:
+    if ranks is None:
+        return "-"
+    cmc = f"#{ranks.coinmarketcap}" if ranks.coinmarketcap is not None else "-"
+    cg = f"#{ranks.coingecko}" if ranks.coingecko is not None else "-"
+    return f"CMC {cmc} / CG {cg}"
+
+
+def quote_volume_value(ticker: Ticker) -> float | None:
+    if ticker.quote_volume is not None:
+        return ticker.quote_volume
+    if ticker.base_volume is not None:
+        return ticker.base_volume * ticker.last
+    return None
+
+
 def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
     return sorted(
         [ticker for ticker in tickers if ticker.exchange != "Coinone"],
-        key=lambda ticker: (ticker.ok, ticker.base_volume or 0),
+        key=lambda ticker: (ticker.ok, quote_volume_value(ticker) or 0),
         reverse=True,
     )
 
@@ -515,13 +1069,27 @@ def market_tickers(tickers: list[Ticker]) -> list[Ticker]:
 def market_price(ticker: Ticker) -> str:
     if not ticker.ok:
         return "error"
+    if ticker.futures_only and ticker.futures_last is not None:
+        return f"{ticker.futures_last:.4f}"
     return f"{ticker.last:.4f}"
 
 
 def market_volume(ticker: Ticker) -> str:
-    if not ticker.ok or ticker.base_volume is None:
+    if not ticker.ok:
         return "-"
-    return compact_volume(ticker.base_volume)
+    return quote_volume_millions(quote_volume_value(ticker))
+
+
+def market_futures_volume(ticker: Ticker) -> str:
+    if not ticker.ok:
+        return "-"
+    return quote_volume_millions(ticker.futures_quote_volume)
+
+
+def market_rank(ticker: Ticker) -> str:
+    if not ticker.ok or ticker.market_rank is None:
+        return "-"
+    return f"#{ticker.market_rank}"
 
 
 def volume_change_value(ticker: Ticker) -> str:
@@ -555,43 +1123,105 @@ def change_color(value: float | None) -> str:
 
 
 def caption_volume(ticker: Ticker) -> str:
-    if not ticker.ok or ticker.base_volume is None:
+    if not ticker.ok:
         return "-"
-    return compact_volume(ticker.base_volume)
+    return quote_volume_millions(quote_volume_value(ticker))
+
+
+def caption_total_volume(value: float) -> str:
+    return quote_volume_millions(value)
+
+
+def caption_change(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:+.0f}%"
+
+
+def caption_exchange(exchange: str) -> str:
+    aliases = {
+        "KuCoin": "KuC",
+        "Kraken": "Krkn",
+        "Bitget": "Bitgt",
+    }
+    return aliases.get(exchange, exchange)[:5]
 
 
 def caption_row(exchange: str, price: str, price_change: str, volume: str, volume_change: str) -> str:
-    return f"{exchange[:7]:<7} {price:>6} {price_change:>7} {volume:>8} {volume_change:>7}"
+    return f"{exchange[:5]:<5} {price:>6} {price_change:>5} {volume:>5} {volume_change:>5}"
 
 
-def render_caption(tickers: list[Ticker], hashrate_ths: float | None = None) -> str:
-    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+def display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def pad_left(text: str, width: int) -> str:
+    return " " * max(0, width - display_width(text)) + text
+
+
+def pad_right(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_width(text))
+
+
+def caption_summary_row(label: str, value: str) -> str:
+    return f"{pad_right(label, 9)} {pad_left(value, 18)}"
+
+
+def render_caption(
+    tickers: list[Ticker],
+    hashrate_ths: float | None = None,
+    display_dt: datetime | None = None,
+    usdt_krw: float | None = None,
+    fear_greed: FearGreedIndex | None = None,
+    global_ranks: GlobalRanks | None = None,
+) -> str:
+    display_dt = display_dt or datetime.now(KST).replace(second=0, microsecond=0)
+    now = display_dt.strftime("%Y-%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
-    usd_prices = [ticker.last for ticker in ok_tickers if ticker.unit in {"USDT", "USD"}]
+    usd_prices = [ticker.last for ticker in ok_tickers if not ticker.futures_only and ticker.unit in {"USDT", "USD"}]
     avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
     coinone = next((ticker for ticker in ok_tickers if ticker.exchange == "Coinone"), None)
 
-    lines = ["<b>KASPA 실시간 티커</b>", now]
+    summary_rows = []
     if avg_usdt:
-        lines.append(f"평균: <b>{avg_usdt:.6f} USDT</b>")
+        summary_rows.append(caption_summary_row("Avg", f"{avg_usdt:.6f} USDT"))
     if coinone:
-        lines.append(f"국내: <b>{coinone.last:,.2f} KRW</b>")
+        summary_rows.append(caption_summary_row("KRW", f"{coinone.last:,.2f} KRW"))
+    if usdt_krw is None and avg_usdt and coinone:
+        usdt_krw = coinone.last / avg_usdt
+    if usdt_krw:
+        summary_rows.append(caption_summary_row("USDT/KRW", f"{usdt_krw:,.2f} KRW"))
+    if fear_greed is not None:
+        summary_rows.append(caption_summary_row("F&G", fmt_fear_greed(fear_greed)))
+    if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
+        summary_rows.append(caption_summary_row("Ranks", fmt_global_ranks(global_ranks)))
+    summary_rows.append(caption_summary_row("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
-        lines.append(f"해시레이트: <b>{fmt_hashrate(hashrate_ths)}</b>")
+        summary_rows.append(caption_summary_row("Hashrate", fmt_hashrate(hashrate_ths)))
+
+    lines = ["<b>KASPA 실시간 티커</b>", f"<code>{html.escape(now)}</code>"]
+    if summary_rows:
+        lines.append("<b>Market / Network</b>")
+        for row in summary_rows:
+            lines.append(f"<code>{html.escape(row)}</code>")
 
     lines.append("")
-    lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'P24h', 'Volume', 'V24h'))}</code>")
+    lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'P24h', 'Vol$', 'V24h'))}</code>")
     total_volume = 0.0
-    for ticker in market_tickers(tickers):
+    for ticker in [ticker for ticker in market_tickers(tickers) if not ticker.futures_only]:
         if not ticker.ok:
-            lines.append(f"<code>{html.escape(caption_row(ticker.exchange, 'error', '-', '-', '-'))}</code>")
+            lines.append(f"<code>{html.escape(caption_row(caption_exchange(ticker.exchange), 'error', '-', '-', '-'))}</code>")
             continue
-        if ticker.base_volume is not None:
-            total_volume += ticker.base_volume
+        quote_volume = quote_volume_value(ticker)
+        if quote_volume is not None:
+            total_volume += quote_volume
         lines.append(
-            f"<code>{html.escape(caption_row(ticker.exchange, market_price(ticker), price_change_value(ticker), caption_volume(ticker), volume_change_value(ticker)))}</code>"
+            f"<code>{html.escape(caption_row(caption_exchange(ticker.exchange), market_price(ticker), caption_change(ticker.price_change_pct), caption_volume(ticker), caption_change(ticker.volume_change_pct)))}</code>"
         )
-    lines.append(f"<code>{html.escape(caption_row('Total', '', '', compact_volume(total_volume), ''))}</code>")
+    lines.append(f"<code>{html.escape(caption_row('Total', '', '', caption_total_volume(total_volume), ''))}</code>")
 
     return "\n".join(lines)
 
@@ -615,8 +1245,9 @@ def render_chart(
     hashrate_ths: float | None = None,
     btc_candles: list[Candle] | None = None,
     transaction_points: list[TransactionPoint] | None = None,
+    display_dt: datetime | None = None,
 ) -> bytes:
-    width, height = 1600, 960
+    width, height = 1600, 1080
     image = Image.new("RGB", (width, height), "#10131a")
     draw = ImageDraw.Draw(image)
     title_font = load_font(50, bold=True)
@@ -626,7 +1257,8 @@ def render_chart(
     draw.rectangle((0, 0, width, 110), fill="#171b24")
     draw.text((48, 28), "KASPA LIVE TICKER", fill="#f3f6fb", font=title_font)
     draw.text((width - 500, 32), "24H / 5M CANDLES", fill="#9aa4b2", font=text_font)
-    draw.text((width - 235, 72), datetime.now(KST).strftime("%H:%M:%S KST"), fill="#9aa4b2", font=small_font)
+    display_dt = display_dt or datetime.now(KST).replace(second=0, microsecond=0)
+    draw.text((width - 235, 72), display_dt.strftime("%H:%M:%S KST"), fill="#9aa4b2", font=small_font)
 
     chart_box = (84, 142, 1516, 590)
     draw.rounded_rectangle(chart_box, radius=12, fill="#0b0e13", outline="#2b3342", width=2)
@@ -647,7 +1279,8 @@ def render_chart(
             return chart_box[3] - 22 - ((price - min_price) / (max_price - min_price)) * (chart_box[3] - chart_box[1] - 44)
 
         inner_left = chart_box[0] + 30
-        inner_right = chart_box[2] - 96
+        label_left = chart_box[2] - 360
+        inner_right = label_left - 28
         step = (inner_right - inner_left) / max(len(candles), 1)
         candle_width = max(2, min(9, int(step * 0.68)))
         candle_start_ts = candles[0].ts
@@ -671,6 +1304,35 @@ def render_chart(
 
             return [(x_for_ts(ts), line_y_for(value)) for ts, value in points]
 
+        end_label_slots: list[tuple[float, float]] = []
+
+        def draw_end_label(x: float, y: float, text: str, fill: str) -> None:
+            pad_x, pad_y = 8, 5
+            bbox = draw.textbbox((0, 0), text, font=small_font)
+            label_width = bbox[2] - bbox[0] + pad_x * 2
+            label_height = bbox[3] - bbox[1] + pad_y * 2
+            label_x = label_left
+            label_y = max(chart_box[1] + 8, min(y - label_height / 2, chart_box[3] - label_height - 8))
+            for used_top, used_bottom in end_label_slots:
+                if label_y < used_bottom + 6 and label_y + label_height > used_top - 6:
+                    label_y = used_bottom + 6
+            if label_y + label_height > chart_box[3] - 8:
+                label_y = chart_box[3] - label_height - 8
+                for used_top, used_bottom in reversed(end_label_slots):
+                    if label_y < used_bottom + 6 and label_y + label_height > used_top - 6:
+                        label_y = used_top - label_height - 6
+            label_y = max(chart_box[1] + 8, min(label_y, chart_box[3] - label_height - 8))
+            end_label_slots.append((label_y, label_y + label_height))
+            draw.line((x + 6, y, label_x - 8, y), fill=fill, width=1)
+            draw.rounded_rectangle(
+                (label_x, label_y, label_x + label_width, label_y + label_height),
+                radius=5,
+                fill="#0b0e13",
+                outline=fill,
+                width=1,
+            )
+            draw.text((label_x + pad_x, label_y + pad_y - bbox[1]), text, fill=fill, font=small_font)
+
         transaction_points = transaction_points or []
         visible_transactions = [
             point
@@ -679,16 +1341,50 @@ def render_chart(
         ]
         if visible_transactions:
             max_transactions = max(point.count for point in visible_transactions) or 1
-            bar_slot = (inner_right - inner_left) / 24
-            bar_width = max(10, bar_slot * 0.62)
+            transaction_diffs = [
+                later.ts - earlier.ts
+                for earlier, later in zip(visible_transactions, visible_transactions[1:])
+                if later.ts > earlier.ts
+            ]
+            transaction_bucket_seconds = min(transaction_diffs) if transaction_diffs else TRANSACTION_BUCKET_SECONDS
+            bar_slot = (transaction_bucket_seconds / max(candle_end_ts - candle_start_ts, 1)) * (inner_right - inner_left)
+            bar_width = max(3, min(20, bar_slot * 0.72))
             max_bar_height = (chart_box[3] - chart_box[1]) * 0.32
+            last_transaction = visible_transactions[-1]
+            last_transaction_x = x_for_ts(last_transaction.ts + transaction_bucket_seconds // 2)
+            last_transaction_height = (last_transaction.count / max_transactions) * max_bar_height
             for point in visible_transactions:
-                x = x_for_ts(point.ts + 30 * 60)
+                x = x_for_ts(point.ts + transaction_bucket_seconds // 2)
                 bar_height = (point.count / max_transactions) * max_bar_height
                 draw.rectangle(
                     (x - bar_width / 2, chart_box[3] - bar_height - 2, x + bar_width / 2, chart_box[3] - 2),
                     fill="#1f2c44",
                 )
+            tx_text = f"TX {compact_count(last_transaction.count)}/5m  max {compact_count(max_transactions)}"
+            tx_bbox = draw.textbbox((0, 0), tx_text, font=small_font)
+            tx_pad_x, tx_pad_y = 8, 5
+            tx_width = tx_bbox[2] - tx_bbox[0] + tx_pad_x * 2
+            tx_height = tx_bbox[3] - tx_bbox[1] + tx_pad_y * 2
+            tx_label_x = label_left
+            tx_label_y = chart_box[3] - tx_height - 14
+            tx_anchor_y = max(
+                chart_box[1] + 18,
+                min(chart_box[3] - last_transaction_height - 2, chart_box[3] - 18),
+            )
+            draw.line((last_transaction_x + 6, tx_anchor_y, tx_label_x - 8, tx_label_y + tx_height / 2), fill="#5f7eb6", width=1)
+            draw.rounded_rectangle(
+                (tx_label_x, tx_label_y, tx_label_x + tx_width, tx_label_y + tx_height),
+                radius=5,
+                fill="#0b0e13",
+                outline="#5f7eb6",
+                width=1,
+            )
+            draw.text(
+                (tx_label_x + tx_pad_x, tx_label_y + tx_pad_y - tx_bbox[1]),
+                tx_text,
+                fill="#9fb8ee",
+                font=small_font,
+            )
 
         for index, candle in enumerate(candles):
             x = inner_left + index * step + step / 2
@@ -704,20 +1400,24 @@ def render_chart(
                 bottom = top + 2
             draw.rectangle((x - candle_width / 2, top, x + candle_width / 2, bottom), fill=color)
 
+        last = candles[-1]
+        last_x = inner_left + (len(candles) - 1) * step + step / 2
+
         hashrate_points = hashrate_points or []
         visible_hashrates = [
             point
             for point in hashrate_points
             if candle_start_ts <= point.ts <= candle_end_ts and point.ths > 0
         ]
+        hashrate_label: tuple[float, float, str, str] | None = None
         if len(visible_hashrates) >= 2:
             line_points = scaled_line_points([(point.ts, point.ths) for point in visible_hashrates])
             draw.line(line_points, fill="#ff304f", width=3, joint="curve")
-            draw.text(
-                (chart_box[2] - 430, chart_box[1] + 58),
+            hashrate_label = (
+                line_points[-1][0],
+                line_points[-1][1],
                 f"Hashrate {fmt_hashrate(hashrate_ths or visible_hashrates[-1].ths)}",
-                fill="#ff7184",
-                font=small_font,
+                "#ff7184",
             )
 
         btc_candles = btc_candles or []
@@ -726,17 +1426,18 @@ def render_chart(
             for candle in btc_candles
             if candle_start_ts <= candle.ts <= candle_end_ts and candle.close > 0
         ]
+        btc_label: tuple[float, float, str, str] | None = None
         if len(visible_btc) >= 2:
             line_points = scaled_line_points([(candle.ts, candle.close) for candle in visible_btc])
             draw.line(line_points, fill="#42a5ff", width=3, joint="curve")
-            draw.text(
-                (chart_box[2] - 430, chart_box[1] + 86),
-                f"BTC {fmt_btc_price(visible_btc[-1].close)}",
-                fill="#78bdff",
-                font=small_font,
-            )
+            btc_label = (line_points[-1][0], line_points[-1][1], f"BTC {fmt_btc_price(visible_btc[-1].close)}", "#78bdff")
 
-        last = candles[-1]
+        draw_end_label(last_x, y_for(last.close), f"KAS {last.close:.6f}", "#f3f6fb")
+        if hashrate_label:
+            draw_end_label(*hashrate_label)
+        if btc_label:
+            draw_end_label(*btc_label)
+
         label_indexes = [0, len(candles) // 4, len(candles) // 2, (len(candles) * 3) // 4, len(candles) - 1]
         for label_index in label_indexes:
             candle = candles[label_index]
@@ -747,7 +1448,6 @@ def render_chart(
 
         draw.text((chart_box[0] + 28, chart_box[1] + 18), f"High {max(highs):.6f}", fill="#9aa4b2", font=small_font)
         draw.text((chart_box[0] + 28, chart_box[3] - 48), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
-        draw.text((chart_box[2] - 330, chart_box[1] + 18), f"Last {last.close:.6f} USDT", fill="#f3f6fb", font=text_font)
     else:
         draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
@@ -757,36 +1457,49 @@ def render_chart(
 
     header_y = 640
     exchange_x = 84
-    price_right_x = 600
-    price_change_right_x = 770
-    volume_right_x = 1365
-    change_right_x = 1516
+    rank_right_x = 355
+    price_right_x = 560
+    price_change_right_x = 715
+    volume_right_x = 1035
+    change_right_x = 1180
+    futures_volume_right_x = 1516
     draw.text((exchange_x, header_y), "Exchange", fill="#9aa4b2", font=small_font)
+    draw_right(rank_right_x, header_y, "Mkt Rank", "#9aa4b2", small_font)
     draw_right(price_right_x, header_y, "Price", "#9aa4b2", small_font)
-    draw_right(price_change_right_x, header_y, "24h", "#9aa4b2", small_font)
-    draw_right(volume_right_x, header_y, "Volume", "#9aa4b2", small_font)
-    draw_right(change_right_x, header_y, "24h", "#9aa4b2", small_font)
+    draw_right(price_change_right_x, header_y, "P24h", "#9aa4b2", small_font)
+    draw_right(volume_right_x, header_y, "Spot $", "#9aa4b2", small_font)
+    draw_right(change_right_x, header_y, "S24h", "#9aa4b2", small_font)
+    draw_right(futures_volume_right_x, header_y, "Fut $", "#9aa4b2", small_font)
     draw.line((84, header_y + 32, 1516, header_y + 32), fill="#2b3342", width=1)
 
     y = 678
     total_volume = 0.0
-    row_font = load_font(27)
+    total_futures_volume = 0.0
+    row_height = 28
+    row_font = load_font(24)
     for ticker in market_tickers(tickers):
         color = "#37d67a" if ticker.ok else "#ff6b6b"
-        if ticker.ok and ticker.base_volume is not None:
-            total_volume += ticker.base_volume
-        if (y - 678) // 31 % 2 == 0:
-            draw.rectangle((84, y - 1, 1516, y + 30), fill="#121720")
+        quote_volume = quote_volume_value(ticker) if ticker.ok else None
+        futures_quote_volume = ticker.futures_quote_volume if ticker.ok else None
+        if quote_volume is not None:
+            total_volume += quote_volume
+        if futures_quote_volume is not None:
+            total_futures_volume += futures_quote_volume
+        if (y - 678) // row_height % 2 == 0:
+            draw.rectangle((84, y - 1, 1516, y + row_height - 1), fill="#121720")
         draw.text((exchange_x, y + 3), ticker.exchange, fill=color, font=row_font)
+        draw_right(rank_right_x, y + 3, market_rank(ticker), "#f3f6fb", row_font)
         draw_right(price_right_x, y + 3, market_price(ticker), "#f3f6fb", row_font)
         draw_right(price_change_right_x, y + 3, price_change_value(ticker), price_change_color(ticker), row_font)
         draw_right(volume_right_x, y + 3, market_volume(ticker), "#f3f6fb", row_font)
         draw_right(change_right_x, y + 3, volume_change_value(ticker), volume_change_color(ticker), row_font)
-        y += 31
+        draw_right(futures_volume_right_x, y + 3, market_futures_volume(ticker), "#f3f6fb", row_font)
+        y += row_height
 
     draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
     draw.text((exchange_x, y + 8), "Total", fill="#9aa4b2", font=row_font)
-    draw_right(volume_right_x, y + 8, compact_volume(total_volume), "#f3f6fb", row_font)
+    draw_right(volume_right_x, y + 8, quote_volume_millions(total_volume), "#f3f6fb", row_font)
+    draw_right(futures_volume_right_x, y + 8, quote_volume_millions(total_futures_volume), "#f3f6fb", row_font)
 
     if IMAGE_SCALE != 1:
         image = image.resize((int(width * IMAGE_SCALE), int(height * IMAGE_SCALE)), Image.Resampling.LANCZOS)
@@ -887,22 +1600,38 @@ def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) 
 
 
 def run_once(dry_run: bool = False) -> None:
+    display_dt = datetime.now(KST).replace(second=0, microsecond=0)
     state = load_state()
     tickers = fetch_tickers()
     history = update_history(state, tickers)
     hashrate_ths = None
+    usdt_krw = None
+    fear_greed = None
+    global_ranks = None
     hashrate_points: list[HashratePoint] = []
     transaction_points: list[TransactionPoint] = []
+    try:
+        usdt_krw = fetch_usdt_krw()
+    except Exception as exc:
+        print(f"usdt/krw fallback: {exc}")
+    try:
+        fear_greed = fetch_fear_greed_index()
+    except Exception as exc:
+        print(f"fear greed fallback: {exc}")
+    try:
+        global_ranks = fetch_global_ranks()
+    except Exception as exc:
+        print(f"global ranks fallback: {exc}")
     try:
         hashrate_ths = fetch_hashrate()
         hashrate_points = fetch_hashrate_history()
     except Exception as exc:
         print(f"hashrate fallback: {exc}")
     try:
-        transaction_points = fetch_transaction_counts()
+        transaction_points = update_transaction_5m_history(state)
     except Exception as exc:
         print(f"transactions fallback: {exc}")
-    caption = render_caption(tickers, hashrate_ths)
+    caption = render_caption(tickers, hashrate_ths, display_dt, usdt_krw, fear_greed, global_ranks)
     try:
         candles = fetch_gate_candles()
     except Exception as exc:
@@ -913,7 +1642,7 @@ def run_once(dry_run: bool = False) -> None:
         btc_candles = fetch_gate_candles("BTC_USDT")
     except Exception as exc:
         print(f"btc fallback: {exc}")
-    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths, btc_candles, transaction_points)
+    chart_png = render_chart(candles, tickers, hashrate_points, hashrate_ths, btc_candles, transaction_points, display_dt)
     CHART_PATH.write_bytes(chart_png)
 
     fingerprint = hashlib.sha256(chart_png + caption.encode("utf-8")).hexdigest()
@@ -935,20 +1664,22 @@ def run_once(dry_run: bool = False) -> None:
     print(f"updated message_id={state.get('message_id')}")
 
 
+def sleep_until_next_tick(interval: int) -> None:
+    now = time.time()
+    next_tick = ((int(now) // interval) + 1) * interval
+    time.sleep(max(0.2, next_tick - now))
+
+
 def loop(interval: int, dry_run: bool = False) -> None:
     while True:
-        started = time.monotonic()
+        sleep_until_next_tick(interval)
         try:
             run_once(dry_run=dry_run)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             print(f"telegram/http error {exc.code}: {body[:300]}")
-            time.sleep(max(interval * 2, 15))
         except Exception as exc:
             print(f"error: {exc}")
-            time.sleep(max(interval, 10))
-        elapsed = time.monotonic() - started
-        time.sleep(max(1, interval - elapsed))
 
 
 def main() -> None:
