@@ -1665,12 +1665,35 @@ def pad_right(text: str, width: int) -> str:
     return text + " " * max(0, width - display_width(text))
 
 
+def fit_display_width(text: str, width: int) -> str:
+    if display_width(text) <= width:
+        return text
+    suffix = "..."
+    suffix_width = display_width(suffix)
+    if width <= suffix_width:
+        return "." * width
+    chars: list[str] = []
+    used = 0
+    for char in text:
+        char_width = 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        if used + char_width > width - suffix_width:
+            break
+        chars.append(char)
+        used += char_width
+    return "".join(chars) + suffix
+
+
 def caption_summary_row(label: str, value: str, value_width: int) -> str:
-    return f"{pad_right(label, 9)} {pad_left(value, value_width)}"
+    fitted_value = fit_display_width(value, value_width)
+    return f"{pad_right(label, 9)} {pad_left(fitted_value, value_width)}"
 
 
 def format_caption_summary_rows(rows: list[tuple[str, str]]) -> list[str]:
-    value_width = max([18, *(display_width(value) for _, value in rows)])
+    dominance = next((value for label, value in rows if label == "Dominance"), None)
+    if dominance:
+        value_width = max(18, display_width(dominance))
+    else:
+        value_width = max([18, *(display_width(value) for _, value in rows)])
     return [caption_summary_row(label, value, value_width) for label, value in rows]
 
 
