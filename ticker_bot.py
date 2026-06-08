@@ -26,12 +26,19 @@ ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "state.json"
 SETTINGS_PATH = ROOT / "settings.json"
 CHART_PATH = ROOT / "kaspa-chart.png"
+LOG_PATH = ROOT / "ticker.log"
+ERR_LOG_PATH = ROOT / "ticker.err.log"
 KST = timezone(timedelta(hours=9))
 IMAGE_SCALE = 1.3
-TRANSACTION_BUCKET_SECONDS = 5 * 60
+TRANSACTION_BUCKET_SECONDS = 60
 TOCATA_HARDFORK_AT = datetime(2026, 6, 30, 16, 15, tzinfo=timezone.utc)
-MARKET_RANK_CACHE_SECONDS = 5 * 60
-SLOW_INDEX_CACHE_SECONDS = 15 * 60
+MARKET_RANK_CACHE_SECONDS = 60
+GLOBAL_RANK_CACHE_SECONDS = 60 * 60
+SLOW_INDEX_CACHE_SECONDS = 60
+WHALE_WALLET_ADDRESS = "kaspa:qpz2vgvlxhmyhmt22h538pjzmvvd52nuut80y5zulgpvyerlskvvwm7n4uk5a"
+SOMPI_PER_KAS = 100_000_000
+WHALE_TRANSFER_ALERT_KAS = 1_000_000
+MAX_RUNTIME_LOG_BYTES = 512 * 1024
 HTTP_METRICS: list[dict[str, Any]] = []
 DEFAULT_SETTINGS: dict[str, Any] = {
     "show_aux_panel": True,
@@ -111,6 +118,15 @@ class MarketDominance:
     bitcoin: float | None = None
     ethereum: float | None = None
     alt_ex_btc_eth: float | None = None
+    kaspa: float | None = None
+
+
+@dataclass
+class CryptoCaps:
+    total1: float | None = None
+    total2: float | None = None
+    total3: float | None = None
+    kaspa: float | None = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -150,6 +166,23 @@ def save_state(state: dict[str, Any]) -> None:
     tmp_path.replace(STATE_PATH)
 
 
+def trim_runtime_log(path: Path, max_bytes: int = MAX_RUNTIME_LOG_BYTES) -> None:
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return
+        with path.open("rb") as handle:
+            handle.seek(-max_bytes // 2, os.SEEK_END)
+            tail = handle.read()
+        path.write_bytes(b"[trimmed old log]\n" + tail)
+    except OSError as exc:
+        print(f"log trim skipped {path.name}: {exc}")
+
+
+def trim_runtime_logs() -> None:
+    trim_runtime_log(LOG_PATH)
+    trim_runtime_log(ERR_LOG_PATH)
+
+
 def cached_value(
     state: dict[str, Any],
     key: str,
@@ -161,7 +194,12 @@ def cached_value(
     item = cache.get(key)
     if isinstance(item, dict) and now - int(item.get("ts", 0)) < ttl_seconds and "value" in item:
         return item["value"]
-    value = fetcher()
+    try:
+        value = fetcher()
+    except Exception:
+        if isinstance(item, dict) and "value" in item:
+            return item["value"]
+        raise
     cache[key] = {"ts": now, "value": value}
     return value
 
@@ -282,12 +320,51 @@ def fetch_global_ranks() -> GlobalRanks:
 
 
 def fetch_market_dominance() -> MarketDominance:
-    payload = http_json("https://api.coingecko.com/api/v3/global")
-    percentages = payload.get("data", {}).get("market_cap_percentage", {})
-    btc = as_float(percentages.get("btc"))
-    eth = as_float(percentages.get("eth"))
+    try:
+        payload = http_json("https://api.coingecko.com/api/v3/global")
+        percentages = payload.get("data", {}).get("market_cap_percentage", {})
+        btc = as_float(percentages.get("btc"))
+        eth = as_float(percentages.get("eth"))
+    except Exception as exc:
+        print(f"coingecko dominance fallback: {exc}")
+        payload = http_json("https://api.coinlore.net/api/global/")
+        row = payload[0] if isinstance(payload, list) and payload else {}
+        btc = as_float(row.get("btc_d"))
+        eth = as_float(row.get("eth_d"))
     alt = 100 - btc - eth if btc is not None and eth is not None else None
     return MarketDominance(bitcoin=btc, ethereum=eth, alt_ex_btc_eth=alt)
+
+
+def fetch_crypto_caps() -> CryptoCaps:
+    try:
+        global_payload = http_json("https://api.coingecko.com/api/v3/global")
+        data = global_payload.get("data", {})
+        total1 = as_float((data.get("total_market_cap") or {}).get("usd"))
+        percentages = data.get("market_cap_percentage", {})
+        btc = as_float(percentages.get("btc"))
+        eth = as_float(percentages.get("eth"))
+        kaspa_payload = http_json(
+            "https://api.coingecko.com/api/v3/coins/kaspa?"
+            "localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false"
+        )
+        kaspa_cap = as_float(((kaspa_payload.get("market_data") or {}).get("market_cap") or {}).get("usd"))
+    except Exception as exc:
+        print(f"coingecko cap fallback: {exc}")
+        global_payload = http_json("https://api.coinlore.net/api/global/")
+        row = global_payload[0] if isinstance(global_payload, list) and global_payload else {}
+        total1 = as_float(row.get("total_mcap"))
+        btc = as_float(row.get("btc_d"))
+        eth = as_float(row.get("eth_d"))
+        kaspa_payload = http_json("https://api.coinlore.net/api/ticker/?id=70485")
+        kaspa_row = kaspa_payload[0] if isinstance(kaspa_payload, list) and kaspa_payload else {}
+        kaspa_cap = as_float(kaspa_row.get("market_cap_usd"))
+    total2 = total1 * (100 - btc) / 100 if total1 is not None and btc is not None else None
+    total3 = (
+        total1 * (100 - btc - eth) / 100
+        if total1 is not None and btc is not None and eth is not None
+        else None
+    )
+    return CryptoCaps(total1=total1, total2=total2, total3=total3, kaspa=kaspa_cap)
 
 
 def fetch_fear_greed_index_cached(state: dict[str, Any]) -> FearGreedIndex:
@@ -312,7 +389,7 @@ def fetch_global_ranks_cached(state: dict[str, Any]) -> GlobalRanks:
     value = cached_value(
         state,
         "global_ranks",
-        SLOW_INDEX_CACHE_SECONDS,
+        GLOBAL_RANK_CACHE_SECONDS,
         fetch,
     )
     return GlobalRanks(
@@ -340,6 +417,31 @@ def fetch_market_dominance_cached(state: dict[str, Any]) -> MarketDominance:
         bitcoin=value.get("bitcoin"),
         ethereum=value.get("ethereum"),
         alt_ex_btc_eth=value.get("alt_ex_btc_eth"),
+        kaspa=value.get("kaspa"),
+    )
+
+
+def fetch_crypto_caps_cached(state: dict[str, Any]) -> CryptoCaps:
+    def fetch() -> dict[str, Any]:
+        caps = fetch_crypto_caps()
+        return {
+            "total1": caps.total1,
+            "total2": caps.total2,
+            "total3": caps.total3,
+            "kaspa": caps.kaspa,
+        }
+
+    value = cached_value(
+        state,
+        "crypto_caps",
+        SLOW_INDEX_CACHE_SECONDS,
+        fetch,
+    )
+    return CryptoCaps(
+        total1=value.get("total1"),
+        total2=value.get("total2"),
+        total3=value.get("total3"),
+        kaspa=value.get("kaspa"),
     )
 
 
@@ -939,26 +1041,46 @@ def fetch_futures_only_tickers() -> list[Ticker]:
     return tickers
 
 
-def fetch_gate_candles(currency_pair: str = "KAS_USDT", hours: int = 24, interval: str = "5m") -> list[Candle]:
-    limit = min(max(hours * 12, 1), 1000)
-    payload = http_json(
-        "https://api.gateio.ws/api/v4/spot/candlesticks?"
-        f"currency_pair={urllib.parse.quote(currency_pair)}&interval={interval}&limit={limit}"
-    )
+def interval_seconds(interval: str) -> int:
+    match = re.fullmatch(r"(\d+)([mhd])", interval)
+    if not match:
+        raise ValueError(f"unsupported interval: {interval}")
+    multipliers = {"m": 60, "h": 60 * 60, "d": 24 * 60 * 60}
+    return int(match.group(1)) * multipliers[match.group(2)]
+
+
+def fetch_gate_candles(currency_pair: str = "KAS_USDT", hours: int = 24, interval: str = "1m") -> list[Candle]:
+    seconds = interval_seconds(interval)
+    max_limit = 900
+    end_ts = int(time.time())
+    start_ts = end_ts - hours * 60 * 60
     candles: list[Candle] = []
-    for row in payload:
-        # Gate: [timestamp, quote_volume, close, high, low, open, base_volume, finished]
-        candles.append(
-            Candle(
-                ts=int(row[0]),
-                open=float(row[5]),
-                high=float(row[3]),
-                low=float(row[4]),
-                close=float(row[2]),
-                volume=float(row[6]),
-            )
+
+    cursor = start_ts
+    while cursor < end_ts:
+        chunk_end = min(end_ts, cursor + max_limit * seconds)
+        payload = http_json(
+            "https://api.gateio.ws/api/v4/spot/candlesticks?"
+            f"currency_pair={urllib.parse.quote(currency_pair)}"
+            f"&interval={urllib.parse.quote(interval)}"
+            f"&from={cursor}&to={chunk_end}&limit={max_limit}"
         )
-    return sorted(candles, key=lambda candle: candle.ts)
+        for row in payload:
+            # Gate: [timestamp, quote_volume, close, high, low, open, base_volume, finished]
+            candles.append(
+                Candle(
+                    ts=int(row[0]),
+                    open=float(row[5]),
+                    high=float(row[3]),
+                    low=float(row[4]),
+                    close=float(row[2]),
+                    volume=float(row[6]),
+                )
+            )
+        cursor = chunk_end
+
+    deduped = {candle.ts: candle for candle in candles if start_ts <= candle.ts <= end_ts}
+    return sorted(deduped.values(), key=lambda candle: candle.ts)
 
 
 def fetch_hashrate() -> float | None:
@@ -971,7 +1093,13 @@ def fetch_hashrate_history(hours: int = 24) -> list[HashratePoint]:
     days = [(now - timedelta(days=1)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")]
     points: list[HashratePoint] = []
     for day in days:
-        payload = http_json(f"https://api.kaspa.org/info/hashrate/history/{day}?resolution=15m")
+        try:
+            payload = http_json(f"https://api.kaspa.org/info/hashrate/history/{day}?resolution=1m")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400:
+                payload = http_json(f"https://api.kaspa.org/info/hashrate/history/{day}?resolution=15m")
+            else:
+                raise
         for row in payload:
             hashrate_kh = as_float(row.get("hashrate_kh"))
             timestamp_ms = row.get("timestamp")
@@ -1006,6 +1134,122 @@ def fetch_transaction_counts(hours: int = 24) -> list[TransactionPoint]:
     return sorted((point for point in points if point.ts >= cutoff), key=lambda point: point.ts)
 
 
+def fetch_wallet_balance(address: str = WHALE_WALLET_ADDRESS) -> float:
+    payload = http_json(f"https://api.kaspa.org/addresses/{urllib.parse.quote(address, safe='')}/balance")
+    return float(payload["balance"]) / SOMPI_PER_KAS
+
+
+def fetch_wallet_transactions(
+    address: str = WHALE_WALLET_ADDRESS,
+    limit: int = 100,
+    max_pages: int = 5,
+    days: int = 30,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    cutoff_ms = (int(time.time()) - days * 24 * 60 * 60) * 1000
+    encoded = urllib.parse.quote(address, safe="")
+    for page in range(max_pages):
+        payload = http_json(
+            f"https://api.kaspa.org/addresses/{encoded}/full-transactions?"
+            f"limit={limit}&offset={page * limit}"
+        )
+        if not isinstance(payload, list) or not payload:
+            break
+        rows.extend(payload)
+        oldest = min(int(tx.get("block_time") or tx.get("accepting_block_time") or 0) for tx in payload)
+        if oldest and oldest < cutoff_ms:
+            break
+    return rows
+
+
+def wallet_tx_flow(tx: dict[str, Any], address: str = WHALE_WALLET_ADDRESS) -> tuple[float, float]:
+    incoming = 0.0
+    outgoing = 0.0
+    for output in tx.get("outputs") or []:
+        if output.get("script_public_key_address") == address:
+            amount = as_float(output.get("amount")) or 0
+            incoming += amount / SOMPI_PER_KAS
+    for tx_input in tx.get("inputs") or []:
+        if tx_input.get("previous_outpoint_address") == address:
+            amount = as_float(tx_input.get("previous_outpoint_amount")) or 0
+            outgoing += amount / SOMPI_PER_KAS
+    return incoming, outgoing
+
+
+def update_wallet_summary(state: dict[str, Any]) -> dict[str, Any]:
+    now = int(time.time())
+    balance = fetch_wallet_balance()
+    transactions = fetch_wallet_transactions()
+    history = [
+        item
+        for item in state.get("whale_wallet_history", [])
+        if isinstance(item, dict) and now - int(item.get("ts", 0) or 0) <= 31 * 24 * 60 * 60
+    ]
+    history.append({"ts": now, "balance": balance})
+    state["whale_wallet_history"] = history
+
+    def baseline_for(seconds: int) -> float | None:
+        target = now - seconds
+        candidates = [item for item in history if int(item.get("ts", 0) or 0) <= target]
+        if not candidates:
+            return None
+        return float(max(candidates, key=lambda item: int(item.get("ts", 0) or 0)).get("balance") or 0)
+
+    def delta_for(seconds: int) -> tuple[float | None, float | None]:
+        baseline = baseline_for(seconds)
+        if baseline is None:
+            return None, None
+        return pct_change(balance, baseline), balance - baseline
+
+    alert = None
+    cutoff_ms = (now - 24 * 60 * 60) * 1000
+    flow_periods = {
+        "24h": {"seconds": 24 * 60 * 60, "in": 0.0, "out": 0.0},
+        "7d": {"seconds": 7 * 24 * 60 * 60, "in": 0.0, "out": 0.0},
+        "30d": {"seconds": 30 * 24 * 60 * 60, "in": 0.0, "out": 0.0},
+    }
+    for tx in transactions:
+        if not tx.get("is_accepted", True):
+            continue
+        tx_time = int(tx.get("block_time") or tx.get("accepting_block_time") or 0)
+        incoming, outgoing = wallet_tx_flow(tx)
+        for item in flow_periods.values():
+            if tx_time and tx_time >= (now - int(item["seconds"])) * 1000:
+                item["in"] = float(item["in"]) + incoming
+                item["out"] = float(item["out"]) + outgoing
+        if tx_time and tx_time < cutoff_ms:
+            continue
+        if incoming >= WHALE_TRANSFER_ALERT_KAS or outgoing >= WHALE_TRANSFER_ALERT_KAS:
+            if incoming >= outgoing:
+                alert = {"direction": "IN", "amount": incoming, "tx": str(tx.get("transaction_id", ""))[:8]}
+            else:
+                alert = {"direction": "OUT", "amount": outgoing, "tx": str(tx.get("transaction_id", ""))[:8]}
+            break
+
+    period_deltas = {
+        "24h": delta_for(24 * 60 * 60),
+        "7d": delta_for(7 * 24 * 60 * 60),
+        "30d": delta_for(30 * 24 * 60 * 60),
+    }
+    for period, item in flow_periods.items():
+        delta_pct, amount_delta = period_deltas[period]
+        if delta_pct is None:
+            net = float(item["in"]) - float(item["out"])
+            if net:
+                estimated_baseline = balance - net
+                period_deltas[period] = (pct_change(balance, estimated_baseline), net)
+    return {
+        "balance": balance,
+        "delta_24h": period_deltas["24h"][0],
+        "delta_7d": period_deltas["7d"][0],
+        "delta_30d": period_deltas["30d"][0],
+        "amount_24h": period_deltas["24h"][1],
+        "amount_7d": period_deltas["7d"][1],
+        "amount_30d": period_deltas["30d"][1],
+        "alert": alert,
+    }
+
+
 def fetch_latest_blue_score() -> int:
     blocks = http_json("https://api.kaspa.org/blocks-from-bluescore?blueScoreLt=999999999999&includeTransactions=false")
     return max(int(block["header"]["blueScore"]) for block in blocks)
@@ -1019,16 +1263,18 @@ def fetch_virtual_chain(blue_score_gte: int) -> list[dict[str, Any]]:
     )
 
 
-def update_transaction_5m_history(state: dict[str, Any], hours: int = 24) -> list[TransactionPoint]:
+def update_transaction_1m_history(state: dict[str, Any], hours: int = 24) -> list[TransactionPoint]:
     latest_blue_score = fetch_latest_blue_score()
+    source = f"virtual_chain_{TRANSACTION_BUCKET_SECONDS}s"
+    bucket_key = f"transaction_{TRANSACTION_BUCKET_SECONDS}s_buckets"
     last_blue_score = as_float(state.get("last_transaction_blue_score"))
-    if state.get("transaction_source") != "virtual_chain_5m":
+    if state.get("transaction_source") != source:
         bucket_counts: dict[int, int] = {}
         last_blue_score = None
     else:
         bucket_counts = {
             int(point["ts"]): int(point["count"])
-            for point in state.get("transaction_5m_buckets", [])
+            for point in state.get(bucket_key, [])
             if point.get("ts") is not None and point.get("count") is not None
         }
 
@@ -1062,9 +1308,9 @@ def update_transaction_5m_history(state: dict[str, Any], hours: int = 24) -> lis
         for bucket_ts, count in sorted(bucket_counts.items())
         if bucket_ts >= cutoff and count > 0
     ]
-    state["transaction_source"] = "virtual_chain_5m"
+    state["transaction_source"] = source
     state["last_transaction_blue_score"] = max_seen_blue_score
-    state["transaction_5m_buckets"] = points
+    state[bucket_key] = points
     return [TransactionPoint(ts=point["ts"], count=point["count"]) for point in points]
 
 
@@ -1106,7 +1352,59 @@ def history_as_candles(history: list[dict[str, Any]]) -> list[Candle]:
     return candles
 
 
-def update_history(state: dict[str, Any], tickers: list[Ticker], max_points: int = 288) -> list[dict[str, Any]]:
+def candles_to_state(candles: list[Candle]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ts": candle.ts,
+            "open": candle.open,
+            "high": candle.high,
+            "low": candle.low,
+            "close": candle.close,
+            "volume": candle.volume,
+        }
+        for candle in candles
+    ]
+
+
+def candles_from_state(rows: Any) -> list[Candle]:
+    candles: list[Candle] = []
+    if not isinstance(rows, list):
+        return candles
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            candles.append(
+                Candle(
+                    ts=int(row["ts"]),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row.get("volume") or 0),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(candles, key=lambda candle: candle.ts)
+
+
+def cache_candles(state: dict[str, Any], key: str, candles: list[Candle]) -> None:
+    if candles:
+        state.setdefault("chart_cache", {})[key] = {"ts": int(time.time()), "candles": candles_to_state(candles)}
+
+
+def cached_candles(state: dict[str, Any], key: str) -> list[Candle]:
+    cache = state.get("chart_cache", {})
+    if not isinstance(cache, dict):
+        return []
+    item = cache.get(key, {})
+    if not isinstance(item, dict):
+        return []
+    return candles_from_state(item.get("candles"))
+
+
+def update_history(state: dict[str, Any], tickers: list[Ticker], max_points: int = 1440) -> list[dict[str, Any]]:
     usd_prices = [
         ticker.last
         for ticker in tickers
@@ -1158,6 +1456,18 @@ def compact_volume(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def compact_kas(value: float | None) -> str:
+    if value is None:
+        return "-"
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.3f}B KAS"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M KAS"
+    if value >= 1_000:
+        return f"{value / 1_000:.2f}K KAS"
+    return f"{value:.2f} KAS"
+
+
 def quote_volume_millions(value: float | None) -> str:
     if value is None:
         return "-"
@@ -1168,9 +1478,13 @@ def quote_volume_millions(value: float | None) -> str:
     return f"{value / 1_000_000:.2f}M"
 
 
-def delta_suffix(value: float | None, threshold: float = 2.0) -> str:
+def delta_suffix(value: float | None, threshold: float = 0.0) -> str:
     if value is None or abs(value) < threshold:
         return ""
+    if value == 0:
+        return "0.0%"
+    if abs(value) < 10:
+        return f"{value:+.1f}%"
     return f"{value:+.0f}%"
 
 
@@ -1209,7 +1523,7 @@ def fmt_hashrate(ths: float | None) -> str:
 def fmt_btc_price(price: float | None) -> str:
     if price is None:
         return "-"
-    return f"{price:,.0f} USDT"
+    return f"{price:,.0f}"
 
 
 def fmt_countdown(target: datetime, now: datetime) -> str:
@@ -1225,32 +1539,87 @@ def fmt_countdown(target: datetime, now: datetime) -> str:
 def fmt_fear_greed(index: FearGreedIndex | None) -> str:
     if index is None:
         return "-"
-    labels = {
-        "Extreme Fear": "극단공포",
-        "Fear": "공포",
-        "Neutral": "중립",
-        "Greed": "탐욕",
-        "Extreme Greed": "극단탐욕",
+    emojis = {
+        "Extreme Fear": "🥶",
+        "Fear": "😨",
+        "Neutral": "😐",
+        "Greed": "🤑",
+        "Extreme Greed": "🔥",
     }
-    classification = labels.get(index.classification, index.classification)
-    return f"{index.value} {classification}".strip()
+    emoji = emojis.get(index.classification, "•")
+    return f"{index.value} {emoji}"
 
 
-def fmt_global_ranks(ranks: GlobalRanks | None) -> str:
+def caption_signed_number(value: int | None) -> str:
+    if value is None:
+        return ""
+    if value > 0:
+        return f" 🟢+{value}"
+    if value < 0:
+        return f" 🔴{value}"
+    return " ⚪0"
+
+
+def fmt_global_ranks(ranks: GlobalRanks | None, rank_deltas: dict[str, int] | None = None) -> str:
     if ranks is None:
         return "-"
-    cmc = f"#{ranks.coinmarketcap}" if ranks.coinmarketcap is not None else "-"
-    cg = f"#{ranks.coingecko}" if ranks.coingecko is not None else "-"
+    rank_deltas = rank_deltas or {}
+    cmc = (
+        f"#{ranks.coinmarketcap}{caption_signed_number(rank_deltas.get('cmc_rank'))}"
+        if ranks.coinmarketcap is not None
+        else "-"
+    )
+    cg = (
+        f"#{ranks.coingecko}{caption_signed_number(rank_deltas.get('cg_rank'))}"
+        if ranks.coingecko is not None
+        else "-"
+    )
     return f"CMC {cmc} / CG {cg}"
 
 
-def fmt_market_dominance(dominance: MarketDominance | None) -> str:
-    if dominance is None:
+def rank_value(rank: int | None, delta: int | None) -> str:
+    if rank is None:
         return "-"
-    btc = f"{dominance.bitcoin:.1f}" if dominance.bitcoin is not None else "-"
-    eth = f"{dominance.ethereum:.1f}" if dominance.ethereum is not None else "-"
-    alt = f"{dominance.alt_ex_btc_eth:.1f}" if dominance.alt_ex_btc_eth is not None else "-"
-    return f"B {btc} E {eth} A {alt}%"
+    return f"#{rank}{caption_signed_number(delta)}"
+
+
+def metric_with_delta(text: str, deltas: dict[str, float], key: str, precision: int = 1) -> str:
+    delta = deltas.get(key)
+    if delta is None:
+        return text
+    return f"{text} {caption_signed_percent(delta, precision=precision)}"
+
+
+def dominance_value(value: float | None, deltas: dict[str, float], key: str) -> str:
+    if value is None:
+        return "-"
+    return metric_with_delta(f"{value:.2f}%", deltas, key, precision=2)
+
+
+def compact_cap(value: float | None) -> str:
+    if value is None:
+        return "-"
+    abs_value = abs(value)
+    if abs_value >= 1_000_000_000_000:
+        return f"${value / 1_000_000_000_000:.2f}T"
+    if abs_value >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.2f}B"
+    if abs_value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    return f"${value:,.0f}"
+
+
+def compact_cap_billions(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"${value / 1_000_000_000:.2f}B"
+
+
+def cap_value(value: float | None, deltas: dict[str, float], key: str, force_billions: bool = False) -> str:
+    if value is None:
+        return "-"
+    text = compact_cap_billions(value) if force_billions else compact_cap(value)
+    return metric_with_delta(text, deltas, key, precision=1)
 
 
 def quote_volume_value(ticker: Ticker) -> float | None:
@@ -1261,8 +1630,167 @@ def quote_volume_value(ticker: Ticker) -> float | None:
     return None
 
 
+def aggregate_delta_pct(items: list[tuple[float | None, float | None]]) -> float | None:
+    current_total = 0.0
+    previous_total = 0.0
+    used = False
+    for current, delta_pct in items:
+        if current is None or delta_pct is None:
+            continue
+        denominator = 1 + delta_pct / 100
+        if denominator == 0:
+            continue
+        current_total += current
+        previous_total += current / denominator
+        used = True
+    if not used or previous_total == 0:
+        return None
+    return ((current_total - previous_total) / previous_total) * 100
+
+
 def ticker_metric_key(ticker: Ticker) -> str:
     return f"futures:{ticker.exchange}" if ticker.futures_only else f"spot:{ticker.exchange}"
+
+
+def pct_change(current: float | None, baseline: Any) -> float | None:
+    baseline_value = as_float(baseline)
+    if current is None or baseline_value in (None, 0):
+        return None
+    return ((current - baseline_value) / baseline_value) * 100
+
+
+def utc_metric_date(now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+
+def metric_snapshot(ticker: Ticker) -> dict[str, Any]:
+    return {
+        "price": ticker.futures_last if ticker.futures_only and ticker.futures_last is not None else ticker.last,
+        "spot_volume": quote_volume_value(ticker),
+        "futures_volume": ticker.futures_quote_volume,
+        "open_interest": ticker.futures_open_interest,
+    }
+
+
+def apply_utc_volume_deltas(state: dict[str, Any], tickers: list[Ticker]) -> None:
+    today = utc_metric_date()
+    baseline_state = state.get("utc_metric_baselines")
+    if not isinstance(baseline_state, dict) or baseline_state.get("date") != today:
+        baseline_state = {"date": today, "metrics": {}}
+        state["utc_metric_baselines"] = baseline_state
+
+    baselines = baseline_state.setdefault("metrics", {})
+    if not isinstance(baselines, dict):
+        baselines = {}
+        baseline_state["metrics"] = baselines
+
+    for ticker in tickers:
+        if not ticker.ok or ticker.exchange == "Coinone":
+            continue
+        key = ticker_metric_key(ticker)
+        snapshot = metric_snapshot(ticker)
+        baseline = baselines.get(key)
+        if not isinstance(baseline, dict):
+            baselines[key] = snapshot
+            ticker.spot_volume_delta_pct = None
+            ticker.futures_volume_delta_pct = None
+            if not ticker.futures_only:
+                ticker.volume_change_pct = None
+            continue
+
+        spot_volume = snapshot.get("spot_volume")
+        futures_volume = snapshot.get("futures_volume")
+        price = snapshot.get("price")
+        open_interest = snapshot.get("open_interest")
+        if "price" not in baseline:
+            baseline["price"] = price
+            ticker.price_change_pct = None
+        else:
+            ticker.price_change_pct = pct_change(price, baseline.get("price"))
+        if "open_interest" not in baseline:
+            baseline["open_interest"] = open_interest
+            ticker.open_interest_delta_pct = None
+        else:
+            ticker.open_interest_delta_pct = pct_change(open_interest, baseline.get("open_interest"))
+        ticker.spot_volume_delta_pct = pct_change(spot_volume, baseline.get("spot_volume"))
+        ticker.futures_volume_delta_pct = pct_change(futures_volume, baseline.get("futures_volume"))
+        if not ticker.futures_only:
+            ticker.volume_change_pct = ticker.spot_volume_delta_pct
+
+
+def latest_transaction_count(transaction_points: list[TransactionPoint]) -> int | None:
+    if not transaction_points:
+        return None
+    return transaction_points[-1].count
+
+
+def summary_metric_values(
+    tickers: list[Ticker],
+    usdt_krw: float | None,
+    fear_greed: FearGreedIndex | None,
+    global_ranks: GlobalRanks | None,
+    market_dominance: MarketDominance | None,
+    crypto_caps: CryptoCaps | None,
+    hashrate_ths: float | None,
+    transaction_count: int | None,
+) -> dict[str, float | int | None]:
+    ok_tickers = [ticker for ticker in tickers if ticker.ok]
+    usd_prices = [ticker.last for ticker in ok_tickers if not ticker.futures_only and ticker.unit in {"USDT", "USD"}]
+    avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
+    coinone = next((ticker for ticker in ok_tickers if ticker.exchange == "Coinone"), None)
+    return {
+        "avg_usdt": avg_usdt,
+        "krw": coinone.last if coinone else None,
+        "usdt_krw": usdt_krw,
+        "fear_greed": fear_greed.value if fear_greed else None,
+        "cmc_rank": global_ranks.coinmarketcap if global_ranks else None,
+        "cg_rank": global_ranks.coingecko if global_ranks else None,
+        "dominance_btc": market_dominance.bitcoin if market_dominance else None,
+        "dominance_eth": market_dominance.ethereum if market_dominance else None,
+        "dominance_alt": market_dominance.alt_ex_btc_eth if market_dominance else None,
+        "dominance_kas": market_dominance.kaspa if market_dominance else None,
+        "cap_total1": crypto_caps.total1 if crypto_caps else None,
+        "cap_total2": crypto_caps.total2 if crypto_caps else None,
+        "cap_total3": crypto_caps.total3 if crypto_caps else None,
+        "cap_kaspa": crypto_caps.kaspa if crypto_caps else None,
+        "hashrate_ths": hashrate_ths,
+        "tx_1m": transaction_count,
+    }
+
+
+def apply_utc_summary_deltas(
+    state: dict[str, Any],
+    values: dict[str, float | int | None],
+) -> tuple[dict[str, float], dict[str, int]]:
+    today = utc_metric_date()
+    baseline_state = state.get("utc_summary_baselines")
+    if not isinstance(baseline_state, dict) or baseline_state.get("date") != today:
+        baseline_state = {"date": today, "metrics": {}}
+        state["utc_summary_baselines"] = baseline_state
+
+    baselines = baseline_state.setdefault("metrics", {})
+    if not isinstance(baselines, dict):
+        baselines = {}
+        baseline_state["metrics"] = baselines
+
+    deltas: dict[str, float] = {}
+    rank_deltas: dict[str, int] = {}
+    rank_keys = {"cmc_rank", "cg_rank"}
+    for key, value in values.items():
+        if value is None:
+            continue
+        baseline = baselines.get(key)
+        if baseline is None:
+            baselines[key] = value
+            continue
+        if key in rank_keys:
+            rank_deltas[key] = int(baseline) - int(value)
+            continue
+        delta = pct_change(float(value), baseline)
+        if delta is not None:
+            deltas[key] = delta
+    return deltas, rank_deltas
 
 
 def apply_metric_deltas(state: dict[str, Any], tickers: list[Ticker]) -> None:
@@ -1278,10 +1806,6 @@ def apply_metric_deltas(state: dict[str, Any], tickers: list[Ticker]) -> None:
         open_interest = ticker.futures_open_interest
         if ticker.market_rank is not None and old.get("rank") is not None:
             ticker.market_rank_delta = int(old["rank"]) - int(ticker.market_rank)
-        if spot_volume is not None and old.get("spot_volume") not in (None, 0):
-            ticker.spot_volume_delta_pct = ((spot_volume - float(old["spot_volume"])) / float(old["spot_volume"])) * 100
-        if futures_volume is not None and old.get("futures_volume") not in (None, 0):
-            ticker.futures_volume_delta_pct = ((futures_volume - float(old["futures_volume"])) / float(old["futures_volume"])) * 100
         if open_interest is not None and old.get("open_interest") not in (None, 0):
             ticker.open_interest_delta_pct = ((open_interest - float(old["open_interest"])) / float(old["open_interest"])) * 100
         current[key] = {
@@ -1365,9 +1889,11 @@ def price_change_color(ticker: Ticker) -> str:
 def change_color(value: float | None) -> str:
     if value is None:
         return "#9aa4b2"
-    if value >= 0:
+    if value > 0:
         return "#37d67a"
-    return "#ff6b6b"
+    if value < 0:
+        return "#ff6b6b"
+    return "#9aa4b2"
 
 
 def caption_volume(ticker: Ticker) -> str:
@@ -1430,7 +1956,7 @@ def caption_funding_summary(tickers: list[Ticker]) -> str | None:
     average, highest, lowest = funding_summary(tickers)
     if average is None:
         return None
-    return f"avg {average * 100:+.3f}%"
+    return f"avg {caption_signed_percent(average * 100, precision=3)}"
 
 
 def kimchi_premium(avg_usdt: float | None, coinone: Ticker | None, usdt_krw: float | None) -> float | None:
@@ -1547,12 +2073,53 @@ def caption_alerts(tickers: list[Ticker], premium: float | None, basis: float | 
     elif average_funding is not None and average_funding <= -0.00005:
         alerts.append("Funding short")
     if premium is not None and abs(premium) >= 1.0:
-        alerts.append(f"Kimchi {premium:+.1f}%")
+        alerts.append(f"Kimchi {caption_signed_percent(premium, precision=1)}")
     if basis is not None and abs(basis) >= 0.25:
-        alerts.append(f"Basis {basis:+.2f}%")
+        alerts.append(f"Basis {caption_signed_percent(basis, precision=2)}")
     if not alerts:
         return None
     return " / ".join(alerts[:2])
+
+
+def priority_alert_text(
+    tickers: list[Ticker],
+    premium: float | None,
+    basis: float | None,
+    wallet_summary: dict[str, Any] | None = None,
+) -> str:
+    watch = []
+    for ticker in tickers:
+        if not ticker.ok:
+            continue
+        if ticker.spot_volume_delta_pct is not None and abs(ticker.spot_volume_delta_pct) >= 20:
+            watch.append(f"{caption_exchange(ticker.exchange)} spot {caption_signed_percent(ticker.spot_volume_delta_pct, 0)}")
+        if ticker.futures_volume_delta_pct is not None and abs(ticker.futures_volume_delta_pct) >= 20:
+            watch.append(f"{caption_exchange(ticker.exchange)} fut {caption_signed_percent(ticker.futures_volume_delta_pct, 0)}")
+        if ticker.open_interest_delta_pct is not None and abs(ticker.open_interest_delta_pct) >= 10:
+            watch.append(f"{caption_exchange(ticker.exchange)} OI {caption_signed_percent(ticker.open_interest_delta_pct, 0)}")
+    if premium is not None and abs(premium) >= 1.0:
+        watch.append(f"Kimchi {caption_signed_percent(premium, 1)}")
+    if basis is not None and abs(basis) >= 0.25:
+        watch.append(f"Basis {caption_signed_percent(basis, 2)}")
+    if watch:
+        return "🔶 Watch " + " / ".join(watch[:2])
+    return "ℹ️ Info calm"
+
+
+def chart_badges(
+    tickers: list[Ticker],
+    alert_text: str,
+    wallet_summary: dict[str, Any] | None,
+    transaction_count: int | None,
+) -> list[str]:
+    futures_total, _ = futures_summary(tickers)
+    wallet_balance = as_float(wallet_summary.get("balance")) if wallet_summary else None
+    return [
+        alert_text.replace("Critical", "Crit").replace("Watch", "Watch").replace("Info", "Info"),
+        f"Wallet {compact_kas(wallet_balance).replace(' KAS', '')}",
+        f"Fut {quote_volume_millions(futures_total)}",
+        f"TX {compact_count(transaction_count)}/m" if transaction_count is not None else "TX -",
+    ]
 
 
 def api_error_labels(tickers: list[Ticker], extra_errors: list[str] | None = None) -> list[str]:
@@ -1573,7 +2140,7 @@ def update_api_status(state: dict[str, Any], tickers: list[Ticker], extra_errors
     status = state.setdefault("api_status", {})
     errors = set(api_error_labels(tickers, extra_errors))
     observed = {ticker.exchange for ticker in tickers}
-    observed.update({"USDT/KRW", "F&G", "Ranks", "Dominance", "Hashrate", "TX", "Candles", "BTC"})
+    observed.update({"USDT/KRW", "F&G", "Ranks", "Dominance", "Crypto CAP", "Hashrate", "TX", "Wallet", "Candles", "BTC"})
     for label in sorted(observed):
         item = status.setdefault(label, {})
         if label in errors:
@@ -1602,7 +2169,7 @@ def data_status_text(state: dict[str, Any], error_labels: list[str]) -> str:
             stale.append(label)
     if stale:
         return "stale " + ",".join(sorted(stale)[:3])
-    return "fresh; cache <=5m"
+    return "fresh; cache <=60s"
 
 
 def update_api_performance(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -1634,7 +2201,19 @@ def api_performance_text(summary: dict[str, Any] | None) -> str | None:
 def caption_change(value: float | None) -> str:
     if value is None:
         return "-"
-    return f"{value:+.0f}%"
+    return caption_signed_percent(value, precision=1 if abs(value) < 10 else 0)
+
+
+def caption_signed_percent(value: float | None, precision: int = 1) -> str:
+    if value is None:
+        return "-"
+    rounded = round(value, precision)
+    text = f"{rounded:+.{precision}f}%" if rounded != 0 else f"{0:.{precision}f}%"
+    if rounded == 0:
+        return f"⚪{text}"
+    if rounded < 0:
+        return f"🔴{text}"
+    return f"🟢{text}"
 
 
 def caption_exchange(exchange: str) -> str:
@@ -1685,16 +2264,31 @@ def fit_display_width(text: str, width: int) -> str:
 
 def caption_summary_row(label: str, value: str, value_width: int) -> str:
     fitted_value = fit_display_width(value, value_width)
-    return f"{pad_right(label, 9)} {pad_left(fitted_value, value_width)}"
+    return f"{pad_right(label, 7)} {fitted_value}"
+
+
+def caption_separator(width: int = 6) -> str:
+    return "-" * width
 
 
 def format_caption_summary_rows(rows: list[tuple[str, str]]) -> list[str]:
-    dominance = next((value for label, value in rows if label == "Dominance"), None)
-    if dominance:
-        value_width = max(18, display_width(dominance))
-    else:
-        value_width = max([18, *(display_width(value) for _, value in rows)])
+    value_width = 42
     return [caption_summary_row(label, value, value_width) for label, value in rows]
+
+
+def caption_html(body_lines: list[str]) -> str:
+    return f"<pre>{html.escape(chr(10).join(body_lines))}</pre>"
+
+
+def fit_caption_html(body_lines: list[str], max_bytes: int = 1010) -> str:
+    fitted = list(body_lines)
+    optional_prefixes = ("Alerts", "Ranks", "Kimchi", "Basis", "API", "Data", "Alert")
+    for prefix in optional_prefixes:
+        caption = caption_html(fitted)
+        if len(caption.encode("utf-8")) <= max_bytes:
+            return caption
+        fitted = [line for line in fitted if not line.startswith(prefix)]
+    return caption_html(fitted)
 
 
 def render_caption(
@@ -1705,13 +2299,20 @@ def render_caption(
     fear_greed: FearGreedIndex | None = None,
     global_ranks: GlobalRanks | None = None,
     market_dominance: MarketDominance | None = None,
+    crypto_caps: CryptoCaps | None = None,
     data_status: str | None = None,
     api_performance: dict[str, Any] | None = None,
     settings: dict[str, Any] | None = None,
+    summary_deltas: dict[str, float] | None = None,
+    rank_deltas: dict[str, int] | None = None,
+    transaction_count: int | None = None,
+    wallet_summary: dict[str, Any] | None = None,
 ) -> str:
     settings = settings or DEFAULT_SETTINGS
+    summary_deltas = summary_deltas or {}
+    rank_deltas = rank_deltas or {}
     display_dt = display_dt or datetime.now(KST).replace(second=0, microsecond=0)
-    now = display_dt.strftime("%Y-%m-%d %H:%M:%S KST")
+    now = display_dt.strftime("%m-%d %H:%M:%S KST")
     ok_tickers = [ticker for ticker in tickers if ticker.ok]
     usd_prices = [ticker.last for ticker in ok_tickers if not ticker.futures_only and ticker.unit in {"USDT", "USD"}]
     avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
@@ -1719,71 +2320,143 @@ def render_caption(
     premium = kimchi_premium(avg_usdt, coinone, usdt_krw)
     basis = futures_basis(avg_usdt, tickers)
 
-    summary_rows: list[tuple[str, str]] = []
+    market_rows: list[tuple[str, str]] = []
+    ranking_rows: list[tuple[str, str]] = []
+    dominance_rows: list[tuple[str, str]] = []
+    crypto_cap_rows: list[tuple[str, str]] = []
+    network_rows: list[tuple[str, str]] = []
+    event_rows: list[tuple[str, str]] = []
+    wallet_rows: list[tuple[str, str]] = []
     if avg_usdt:
-        summary_rows.append(("Avg", f"{avg_usdt:.6f} USDT"))
+        market_rows.append(("Avg", metric_with_delta(f"{avg_usdt:.6f} USDT", summary_deltas, "avg_usdt")))
     if coinone:
-        summary_rows.append(("KRW", f"{coinone.last:,.2f} KRW"))
+        market_rows.append(("KRW", metric_with_delta(f"{coinone.last:,.2f} KRW", summary_deltas, "krw")))
     if usdt_krw is None and avg_usdt and coinone:
         usdt_krw = coinone.last / avg_usdt
     if usdt_krw:
-        summary_rows.append(("USDT/KRW", f"{usdt_krw:,.2f} KRW"))
+        market_rows.append(("USDT/KRW", metric_with_delta(f"{usdt_krw:,.2f} KRW", summary_deltas, "usdt_krw")))
     if premium is not None:
-        summary_rows.append(("Kimchi", f"{premium:+.2f}%"))
+        market_rows.append(("Kimchi", caption_signed_percent(premium, precision=2)))
     if basis is not None:
-        summary_rows.append(("Basis", f"{basis:+.2f}%"))
-    if settings.get("show_futures_interpretation", True):
-        summary_rows.append(("Futures", futures_interpretation(tickers, basis)))
+        market_rows.append(("Basis", caption_signed_percent(basis, precision=2)))
     if fear_greed is not None:
-        summary_rows.append(("F&G", fmt_fear_greed(fear_greed)))
+        market_rows.append(("F&G", metric_with_delta(fmt_fear_greed(fear_greed), summary_deltas, "fear_greed")))
     if global_ranks is not None and (global_ranks.coinmarketcap is not None or global_ranks.coingecko is not None):
-        summary_rows.append(("Ranks", fmt_global_ranks(global_ranks)))
+        ranking_rows.extend(
+            [
+                ("CMC", rank_value(global_ranks.coinmarketcap, rank_deltas.get("cmc_rank"))),
+                ("CG", rank_value(global_ranks.coingecko, rank_deltas.get("cg_rank"))),
+            ]
+        )
     if market_dominance is not None:
-        summary_rows.append(("Dominance", fmt_market_dominance(market_dominance)))
-    futures_caption = caption_futures_summary(tickers)
-    if futures_caption:
-        summary_rows.append(("Fut Vol", futures_caption))
-    oi_caption = caption_open_interest_summary(tickers)
-    if oi_caption:
-        summary_rows.append(("OI", oi_caption))
-    funding_caption = caption_funding_summary(tickers)
-    if funding_caption:
-        summary_rows.append(("Funding", funding_caption))
-    summary_rows.append(("Interest", f"{interest_score(tickers):+.1f}"))
-    alerts = caption_alerts(tickers, premium, basis)
-    if alerts:
-        summary_rows.append(("Alerts", alerts))
-    if data_status:
-        summary_rows.append(("Data", data_status))
+        dominance_rows.extend(
+            [
+                ("BTC", dominance_value(market_dominance.bitcoin, summary_deltas, "dominance_btc")),
+                ("ETH", dominance_value(market_dominance.ethereum, summary_deltas, "dominance_eth")),
+                ("ALT", dominance_value(market_dominance.alt_ex_btc_eth, summary_deltas, "dominance_alt")),
+                ("KAS", dominance_value(market_dominance.kaspa, summary_deltas, "dominance_kas")),
+            ]
+        )
+    if crypto_caps is not None:
+        crypto_cap_rows.extend(
+            [
+                ("TOTAL1", cap_value(crypto_caps.total1, summary_deltas, "cap_total1")),
+                ("TOTAL2", cap_value(crypto_caps.total2, summary_deltas, "cap_total2")),
+                ("TOTAL3", cap_value(crypto_caps.total3, summary_deltas, "cap_total3")),
+                ("KAS", cap_value(crypto_caps.kaspa, summary_deltas, "cap_kaspa", force_billions=True)),
+            ]
+        )
+    market_rows.append(("Alert", priority_alert_text(tickers, premium, basis, wallet_summary)))
+    if data_status and not data_status.startswith("fresh"):
+        network_rows.append(("Data", data_status))
     api_text = api_performance_text(api_performance)
     if api_text and settings.get("show_api_quality", True):
-        summary_rows.append(("API", api_text))
-    summary_rows.append(("Tocata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
+        network_rows.append(("API", api_text))
+    event_rows.append(("Toccata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
-        summary_rows.append(("Hashrate", fmt_hashrate(hashrate_ths)))
+        network_rows.append(("HR", metric_with_delta(fmt_hashrate(hashrate_ths), summary_deltas, "hashrate_ths")))
+    if transaction_count is not None:
+        network_rows.append(("TX", metric_with_delta(f"{compact_count(transaction_count)}/1m", summary_deltas, "tx_1m")))
+    if wallet_summary:
+        wallet_rows.append(("1st 🐋", compact_kas(as_float(wallet_summary.get("balance")))))
+        ranges = []
+        for label, key in (("24h", "delta_24h"), ("7d", "delta_7d"), ("30d", "delta_30d")):
+            delta = wallet_summary.get(key)
+            ranges.append(f"{label} {caption_signed_percent(delta, precision=1) if delta is not None else 'wait'}")
+        wallet_rows.append(("WΔ", " ".join(ranges)))
+        alert = wallet_summary.get("alert")
+        if isinstance(alert, dict):
+            wallet_rows.append(("⚠️", f"{alert.get('direction')} {compact_kas(as_float(alert.get('amount')))}"))
 
-    lines = ["<b>KASPA 실시간 티커</b>", f"<code>{html.escape(now)}</code>"]
-    if summary_rows:
-        lines.append("<b>Market / Network</b>")
-        for row in format_caption_summary_rows(summary_rows):
-            lines.append(f"<code>{html.escape(row)}</code>")
+    separator = caption_separator()
+    body_lines = [now, separator]
+    if market_rows:
+        body_lines.append("Market")
+        for row in format_caption_summary_rows(market_rows):
+            body_lines.append(row)
+    if ranking_rows:
+        body_lines.append(separator)
+        body_lines.append("Ranking")
+        for row in format_caption_summary_rows(ranking_rows):
+            body_lines.append(row)
+    if dominance_rows:
+        body_lines.append(separator)
+        body_lines.append("Dominance")
+        for row in format_caption_summary_rows(dominance_rows):
+            body_lines.append(row)
+    if crypto_cap_rows:
+        body_lines.append(separator)
+        body_lines.append("Crypto CAP")
+        for row in format_caption_summary_rows(crypto_cap_rows):
+            body_lines.append(row)
+    if network_rows:
+        body_lines.append(separator)
+        body_lines.append("Network")
+        for row in format_caption_summary_rows(network_rows):
+            body_lines.append(row)
+    if event_rows:
+        body_lines.append(separator)
+        body_lines.append("Event")
+        for row in format_caption_summary_rows(event_rows):
+            body_lines.append(row)
+    if wallet_rows:
+        body_lines.append(separator)
+        body_lines.append("Wallet")
+        for row in format_caption_summary_rows(wallet_rows):
+            body_lines.append(row)
 
-    lines.append("")
-    lines.append(f"<code>{html.escape(caption_row('Exch', 'Price', 'P24h', 'Vol$', 'V24h'))}</code>")
+    body_lines.append(separator)
+    body_lines.append(caption_row("Exch", "Price", "PUTC", "Vol$", "VUTC"))
     total_volume = 0.0
+    total_delta_items: list[tuple[float | None, float | None]] = []
     for ticker in [ticker for ticker in market_tickers(tickers) if not ticker.futures_only]:
         if not ticker.ok:
-            lines.append(f"<code>{html.escape(caption_row(caption_exchange(ticker.exchange), 'error', '-', '-', '-'))}</code>")
+            body_lines.append(caption_row(caption_exchange(ticker.exchange), "error", "-", "-", "-"))
             continue
         quote_volume = quote_volume_value(ticker)
         if quote_volume is not None:
             total_volume += quote_volume
-        lines.append(
-            f"<code>{html.escape(caption_row(caption_exchange(ticker.exchange), market_price(ticker), caption_change(ticker.price_change_pct), caption_volume(ticker), caption_change(ticker.volume_change_pct)))}</code>"
+            total_delta_items.append((quote_volume, ticker.volume_change_pct))
+        body_lines.append(
+            caption_row(
+                caption_exchange(ticker.exchange),
+                market_price(ticker),
+                caption_change(ticker.price_change_pct),
+                caption_volume(ticker),
+                caption_change(ticker.volume_change_pct),
+            )
         )
-    lines.append(f"<code>{html.escape(caption_row('Total', '', '', caption_total_volume(total_volume), ''))}</code>")
+    body_lines.append(
+        caption_row(
+            "Total",
+            "",
+            "",
+            caption_total_volume(total_volume),
+            caption_change(aggregate_delta_pct(total_delta_items)),
+        )
+    )
 
-    return "\n".join(lines)
+    return fit_caption_html(body_lines)
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -1807,6 +2480,7 @@ def render_chart(
     transaction_points: list[TransactionPoint] | None = None,
     display_dt: datetime | None = None,
     api_errors: list[str] | None = None,
+    chart_badges: list[str] | None = None,
 ) -> bytes:
     width, height = 1600, 1080
     image = Image.new("RGB", (width, height), "#10131a")
@@ -1817,9 +2491,17 @@ def render_chart(
 
     draw.rectangle((0, 0, width, 110), fill="#171b24")
     draw.text((48, 28), "KASPA LIVE TICKER", fill="#f3f6fb", font=title_font)
-    draw.text((width - 500, 32), "24H / 5M CANDLES", fill="#9aa4b2", font=text_font)
+    draw.text((width - 500, 32), "24H / 1M CANDLES", fill="#9aa4b2", font=text_font)
     display_dt = display_dt or datetime.now(KST).replace(second=0, microsecond=0)
     draw.text((width - 235, 72), display_dt.strftime("%H:%M:%S KST"), fill="#9aa4b2", font=small_font)
+    badge_x = 470
+    for badge in (chart_badges or [])[:4]:
+        badge_text = fit_display_width(badge, 20)
+        bbox = draw.textbbox((0, 0), badge_text, font=small_font)
+        badge_width = min(210, bbox[2] - bbox[0] + 20)
+        draw.rounded_rectangle((badge_x, 70, badge_x + badge_width, 100), radius=5, fill="#101722", outline="#2b3342")
+        draw.text((badge_x + 10, 75 - bbox[1]), badge_text, fill="#dfe7f3", font=small_font)
+        badge_x += badge_width + 10
 
     chart_box = (84, 142, 1516, 590)
     draw.rounded_rectangle(chart_box, radius=12, fill="#0b0e13", outline="#2b3342", width=2)
@@ -1919,7 +2601,7 @@ def render_chart(
                 width=1,
             )
             draw.line((inner_left, bar_panel_mid, inner_right, bar_panel_mid), fill="#394861", width=2)
-            draw.text((inner_left + 8, bar_panel_top + 4), "HR", fill="#ff8fac", font=small_font)
+            draw.text((inner_left + 8, bar_panel_top + 4), "HR15", fill="#ff8fac", font=small_font)
             draw.text((inner_left + 8, bar_panel_mid + 4), "TX", fill="#9fb8ee", font=small_font)
         if visible_hashrates:
             hashrate_values = [point.ths for point in visible_hashrates]
@@ -1974,7 +2656,7 @@ def render_chart(
                     (x - bar_width / 2, bar_panel_mid + 1, x + bar_width / 2, min(bar_panel_bottom, bar_panel_mid + bar_height)),
                     fill="#1f2c44",
                 )
-            tx_text = f"TX {compact_count(last_transaction.count)}/5m  max {compact_count(max_transactions)}"
+            tx_text = f"TX {compact_count(last_transaction.count)}/1m  max {compact_count(max_transactions)}"
             tx_bbox = draw.textbbox((0, 0), tx_text, font=small_font)
             tx_pad_x, tx_pad_y = 8, 5
             tx_width = tx_bbox[2] - tx_bbox[0] + tx_pad_x * 2
@@ -2078,28 +2760,46 @@ def render_chart(
     header_y = 640
     exchange_x = 84
     rank_right_x = 330
-    price_right_x = 520
-    price_change_right_x = 660
-    volume_right_x = 875
-    change_right_x = 1010
-    futures_volume_right_x = 1195
-    open_interest_right_x = 1370
+    price_right_x = 530
+    price_change_right_x = 690
+    volume_right_x = 980
+    futures_volume_right_x = 1235
+    open_interest_right_x = 1395
     funding_right_x = 1516
     draw.text((exchange_x, header_y), "Exchange", fill="#9aa4b2", font=small_font)
     draw_right(rank_right_x, header_y, "Mkt Rank", "#9aa4b2", small_font)
     draw_right(price_right_x, header_y, "Price", "#9aa4b2", small_font)
-    draw_right(price_change_right_x, header_y, "P24h", "#9aa4b2", small_font)
-    draw_right(volume_right_x, header_y, "Spot $", "#9aa4b2", small_font)
-    draw_right(change_right_x, header_y, "S24h", "#9aa4b2", small_font)
-    draw_right(futures_volume_right_x, header_y, "Fut $", "#9aa4b2", small_font)
-    draw_right(open_interest_right_x, header_y, "OI $", "#9aa4b2", small_font)
+    draw_right(price_change_right_x, header_y, "PUTC", "#9aa4b2", small_font)
+    draw_right(volume_right_x, header_y, "Spot $ UTC", "#9aa4b2", small_font)
+    draw_right(futures_volume_right_x, header_y, "Fut $ UTC", "#9aa4b2", small_font)
+    draw_right(open_interest_right_x, header_y, "OI $ UTC", "#9aa4b2", small_font)
     draw_right(funding_right_x, header_y, "Fund", "#9aa4b2", small_font)
     draw.line((84, header_y + 32, 1516, header_y + 32), fill="#2b3342", width=1)
+
+    def draw_metric_with_delta(
+        right_x: int,
+        y_pos: int,
+        value: float | None,
+        delta_pct: float | None,
+        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    ) -> None:
+        base = quote_volume_millions(value)
+        suffix = delta_suffix(delta_pct)
+        if not suffix:
+            draw_right(right_x, y_pos, base, "#f3f6fb", font)
+            return
+        suffix_bbox = draw.textbbox((0, 0), suffix, font=font)
+        suffix_width = suffix_bbox[2] - suffix_bbox[0]
+        draw_right(right_x, y_pos, suffix, change_color(delta_pct), font)
+        draw_right(right_x - suffix_width - 6, y_pos, base, "#f3f6fb", font)
 
     y = 678
     total_volume = 0.0
     total_futures_volume = 0.0
     total_open_interest = 0.0
+    total_volume_delta_items: list[tuple[float | None, float | None]] = []
+    total_futures_delta_items: list[tuple[float | None, float | None]] = []
+    total_open_interest_delta_items: list[tuple[float | None, float | None]] = []
     row_height = 28
     row_font = load_font(22)
     for ticker in market_tickers(tickers):
@@ -2109,28 +2809,42 @@ def render_chart(
         open_interest = ticker.futures_open_interest if ticker.ok else None
         if quote_volume is not None:
             total_volume += quote_volume
+            total_volume_delta_items.append((quote_volume, ticker.spot_volume_delta_pct))
         if futures_quote_volume is not None:
             total_futures_volume += futures_quote_volume
+            total_futures_delta_items.append((futures_quote_volume, ticker.futures_volume_delta_pct))
         if open_interest is not None:
             total_open_interest += open_interest
+            total_open_interest_delta_items.append((open_interest, ticker.open_interest_delta_pct))
         if (y - 678) // row_height % 2 == 0:
             draw.rectangle((84, y - 1, 1516, y + row_height - 1), fill="#121720")
         draw.text((exchange_x, y + 3), ticker.exchange, fill=color, font=row_font)
         draw_right(rank_right_x, y + 3, market_rank(ticker), "#f3f6fb", row_font)
         draw_right(price_right_x, y + 3, market_price(ticker), "#f3f6fb", row_font)
         draw_right(price_change_right_x, y + 3, price_change_value(ticker), price_change_color(ticker), row_font)
-        draw_right(volume_right_x, y + 3, market_volume(ticker), "#f3f6fb", row_font)
-        draw_right(change_right_x, y + 3, volume_change_value(ticker), volume_change_color(ticker), row_font)
-        draw_right(futures_volume_right_x, y + 3, market_futures_volume(ticker), "#f3f6fb", row_font)
-        draw_right(open_interest_right_x, y + 3, market_open_interest(ticker), "#f3f6fb", row_font)
+        draw_metric_with_delta(volume_right_x, y + 3, quote_volume, ticker.spot_volume_delta_pct, row_font)
+        draw_metric_with_delta(futures_volume_right_x, y + 3, futures_quote_volume, ticker.futures_volume_delta_pct, row_font)
+        draw_metric_with_delta(open_interest_right_x, y + 3, open_interest, ticker.open_interest_delta_pct, row_font)
         draw_right(funding_right_x, y + 3, market_funding(ticker), change_color(ticker.futures_funding_rate), row_font)
         y += row_height
 
     draw.line((84, y + 2, 1516, y + 2), fill="#2b3342", width=1)
     draw.text((exchange_x, y + 8), "Total", fill="#9aa4b2", font=row_font)
-    draw_right(volume_right_x, y + 8, quote_volume_millions(total_volume), "#f3f6fb", row_font)
-    draw_right(futures_volume_right_x, y + 8, quote_volume_millions(total_futures_volume), "#f3f6fb", row_font)
-    draw_right(open_interest_right_x, y + 8, quote_volume_millions(total_open_interest), "#f3f6fb", row_font)
+    draw_metric_with_delta(volume_right_x, y + 8, total_volume, aggregate_delta_pct(total_volume_delta_items), row_font)
+    draw_metric_with_delta(
+        futures_volume_right_x,
+        y + 8,
+        total_futures_volume,
+        aggregate_delta_pct(total_futures_delta_items),
+        row_font,
+    )
+    draw_metric_with_delta(
+        open_interest_right_x,
+        y + 8,
+        total_open_interest,
+        aggregate_delta_pct(total_open_interest_delta_items),
+        row_font,
+    )
 
     if api_errors:
         error_text = "API miss: " + ", ".join(api_errors[:6])
@@ -2138,7 +2852,7 @@ def render_chart(
             error_text += f" +{len(api_errors) - 6}"
         draw.text((84, height - 34), error_text, fill="#ff9f43", font=small_font)
     else:
-        draw.text((84, height - 34), "Data: fresh; cache <=5m", fill="#6f7b8f", font=small_font)
+        draw.text((84, height - 34), "Data: fresh; cache <=60s", fill="#6f7b8f", font=small_font)
 
     if IMAGE_SCALE != 1:
         image = image.resize((int(width * IMAGE_SCALE), int(height * IMAGE_SCALE)), Image.Resampling.LANCZOS)
@@ -2239,6 +2953,7 @@ def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) 
 
 
 def run_once(dry_run: bool = False) -> None:
+    trim_runtime_logs()
     HTTP_METRICS.clear()
     display_dt = datetime.now(KST).replace(second=0, microsecond=0)
     settings = load_settings()
@@ -2246,12 +2961,15 @@ def run_once(dry_run: bool = False) -> None:
     run_errors: list[str] = []
     tickers = fetch_tickers(state)
     apply_metric_deltas(state, tickers)
+    apply_utc_volume_deltas(state, tickers)
     history = update_history(state, tickers)
     hashrate_ths = None
     usdt_krw = None
     fear_greed = None
     global_ranks = None
     market_dominance = None
+    crypto_caps = None
+    wallet_summary = None
     hashrate_points: list[HashratePoint] = []
     transaction_points: list[TransactionPoint] = []
     try:
@@ -2275,31 +2993,65 @@ def run_once(dry_run: bool = False) -> None:
         print(f"market dominance fallback: {exc}")
         run_errors.append("Dominance")
     try:
+        crypto_caps = fetch_crypto_caps_cached(state)
+    except Exception as exc:
+        print(f"crypto cap fallback: {exc}")
+        run_errors.append("Crypto CAP")
+    if market_dominance is not None and crypto_caps is not None and crypto_caps.total1 and crypto_caps.kaspa:
+        market_dominance.kaspa = crypto_caps.kaspa / crypto_caps.total1 * 100
+    try:
         hashrate_ths = fetch_hashrate()
         hashrate_points = fetch_hashrate_history()
     except Exception as exc:
         print(f"hashrate fallback: {exc}")
         run_errors.append("Hashrate")
     try:
-        transaction_points = update_transaction_5m_history(state)
+        transaction_points = update_transaction_1m_history(state)
     except Exception as exc:
         print(f"transactions fallback: {exc}")
         run_errors.append("TX")
     try:
+        wallet_summary = update_wallet_summary(state)
+    except Exception as exc:
+        print(f"wallet fallback: {exc}")
+        run_errors.append("Wallet")
+    try:
         candles = fetch_gate_candles()
+        cache_candles(state, "KAS_USDT:1m:24h", candles)
     except Exception as exc:
         print(f"candle fallback: {exc}")
         run_errors.append("Candles")
-        candles = history_as_candles(history)
+        candles = cached_candles(state, "KAS_USDT:1m:24h") or history_as_candles(history)
     btc_candles: list[Candle] = []
     try:
         btc_candles = fetch_gate_candles("BTC_USDT")
+        cache_candles(state, "BTC_USDT:1m:24h", btc_candles)
     except Exception as exc:
         print(f"btc fallback: {exc}")
         run_errors.append("BTC")
+        btc_candles = cached_candles(state, "BTC_USDT:1m:24h")
     error_labels = update_api_status(state, tickers, run_errors)
     api_performance = update_api_performance(state)
     status_text = data_status_text(state, error_labels)
+    transaction_count = latest_transaction_count(transaction_points)
+    summary_values = summary_metric_values(
+        tickers,
+        usdt_krw,
+        fear_greed,
+        global_ranks,
+        market_dominance,
+        crypto_caps,
+        hashrate_ths,
+        transaction_count,
+    )
+    summary_deltas, rank_deltas = apply_utc_summary_deltas(state, summary_values)
+    ok_tickers = [ticker for ticker in tickers if ticker.ok]
+    usd_prices = [ticker.last for ticker in ok_tickers if not ticker.futures_only and ticker.unit in {"USDT", "USD"}]
+    avg_usdt = sum(usd_prices) / len(usd_prices) if usd_prices else None
+    coinone = next((ticker for ticker in ok_tickers if ticker.exchange == "Coinone"), None)
+    premium = kimchi_premium(avg_usdt, coinone, usdt_krw)
+    basis = futures_basis(avg_usdt, tickers)
+    alert_text = priority_alert_text(tickers, premium, basis, wallet_summary)
     caption = render_caption(
         tickers,
         hashrate_ths,
@@ -2308,9 +3060,14 @@ def run_once(dry_run: bool = False) -> None:
         fear_greed,
         global_ranks,
         market_dominance,
+        crypto_caps,
         status_text,
         api_performance,
         settings,
+        summary_deltas,
+        rank_deltas,
+        transaction_count,
+        wallet_summary,
     )
     chart_hashrate_points = hashrate_points if settings.get("show_aux_panel", True) else []
     chart_transaction_points = transaction_points if settings.get("show_aux_panel", True) else []
@@ -2323,6 +3080,7 @@ def run_once(dry_run: bool = False) -> None:
         chart_transaction_points,
         display_dt,
         error_labels,
+        chart_badges(tickers, alert_text, wallet_summary, transaction_count),
     )
     CHART_PATH.write_bytes(chart_png)
 
@@ -2386,7 +3144,7 @@ def main() -> None:
             print(f"error: {exc}")
             sys.exit(1)
     else:
-        loop(max(args.interval, 5), dry_run=args.dry_run)
+        loop(max(args.interval, 60), dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 
 - public 거래소 ticker API에서 KAS 시세를 가져옵니다.
 - 최근 KAS/USDT 평균 가격을 `state.json`에 저장해 간단한 차트 PNG를 만듭니다.
+- 볼륨 증감률은 UTC+0 날짜 기준으로, 해당 UTC 일자의 첫 조회값 대비 증가율로 표시합니다.
 - 첫 실행 때는 `sendPhoto`로 메시지를 하나 보냅니다.
 - 이후에는 저장된 `message_id`를 사용해 `editMessageMedia`로 같은 메시지를 수정합니다.
 - 동일한 렌더링 결과면 Telegram API 호출을 건너뜁니다.
