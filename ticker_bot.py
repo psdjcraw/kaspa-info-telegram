@@ -1404,6 +1404,52 @@ def cached_candles(state: dict[str, Any], key: str) -> list[Candle]:
     return candles_from_state(item.get("candles"))
 
 
+def candle_pct_change(candles: list[Candle], seconds: int) -> float | None:
+    if not candles:
+        return None
+    ordered = sorted(candles, key=lambda candle: candle.ts)
+    latest = ordered[-1]
+    target_ts = latest.ts - seconds
+    baseline = None
+    for candle in ordered:
+        if candle.ts <= target_ts:
+            baseline = candle
+        else:
+            break
+    if baseline is None:
+        return None
+    return pct_change(latest.close, baseline.close)
+
+
+def trend_summary(candles_1m: list[Candle], candles_1d: list[Candle]) -> dict[str, float | None]:
+    return {
+        "15m": candle_pct_change(candles_1m, 15 * 60),
+        "4h": candle_pct_change(candles_1m, 4 * 60 * 60),
+        "1w": candle_pct_change(candles_1d, 7 * 24 * 60 * 60),
+        "1M": candle_pct_change(candles_1d, 30 * 24 * 60 * 60),
+    }
+
+
+def compact_trend_percent(value: float | None) -> str:
+    if value is None:
+        return "-"
+    rounded = round(value, 1)
+    if rounded == 0:
+        return "⚪0.0"
+    if rounded < 0:
+        return f"🔴{abs(rounded):.1f}"
+    return f"🟢{rounded:.1f}"
+
+
+def fmt_trending(trends: dict[str, float | None] | None) -> str:
+    if not trends:
+        return "-"
+    parts = []
+    for label in ("15m", "4h", "1w", "1M"):
+        parts.append(f"{label}{compact_trend_percent(trends.get(label))}")
+    return " ".join(parts)
+
+
 def update_history(state: dict[str, Any], tickers: list[Ticker], max_points: int = 1440) -> list[dict[str, Any]]:
     usd_prices = [
         ticker.last
@@ -1534,6 +1580,35 @@ def fmt_countdown(target: datetime, now: datetime) -> str:
     hours, remainder = divmod(remainder, 60 * 60)
     minutes, seconds = divmod(remainder, 60)
     return f"D-{days} {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def event_emoji(target: datetime, now: datetime) -> str:
+    remaining_seconds = int((target - now.astimezone(timezone.utc)).total_seconds())
+    if remaining_seconds <= 0:
+        return "✅"
+    if remaining_seconds <= 24 * 60 * 60:
+        return "🔴"
+    if remaining_seconds <= 3 * 24 * 60 * 60:
+        return "🟠"
+    if remaining_seconds <= 7 * 24 * 60 * 60:
+        return "🟡"
+    return "📅"
+
+
+def event_countdown_text(target: datetime, now: datetime) -> str:
+    countdown = fmt_countdown(target, now)
+    if countdown != "started":
+        parts = countdown.split()
+        if len(parts) == 2:
+            hours, minutes, _seconds = parts[1].split(":")
+            countdown = f"{parts[0]} {hours}:{minutes}"
+    return f"{event_emoji(target, now)} {countdown}"
+
+
+def event_badge_text(target: datetime, now: datetime) -> str:
+    countdown = fmt_countdown(target, now)
+    short_countdown = countdown.split()[0] if countdown != "started" else "started"
+    return f"Toccata {event_emoji(target, now)} {short_countdown}"
 
 
 def fmt_fear_greed(index: FearGreedIndex | None) -> str:
@@ -2111,14 +2186,15 @@ def chart_badges(
     alert_text: str,
     wallet_summary: dict[str, Any] | None,
     transaction_count: int | None,
+    display_dt: datetime,
 ) -> list[str]:
     futures_total, _ = futures_summary(tickers)
     wallet_balance = as_float(wallet_summary.get("balance")) if wallet_summary else None
     return [
+        event_badge_text(TOCATA_HARDFORK_AT, display_dt),
         alert_text.replace("Critical", "Crit").replace("Watch", "Watch").replace("Info", "Info"),
         f"Wallet {compact_kas(wallet_balance).replace(' KAS', '')}",
-        f"Fut {quote_volume_millions(futures_total)}",
-        f"TX {compact_count(transaction_count)}/m" if transaction_count is not None else "TX -",
+        f"TX {compact_count(transaction_count)}/m" if transaction_count is not None else f"Fut {quote_volume_millions(futures_total)}",
     ]
 
 
@@ -2140,7 +2216,7 @@ def update_api_status(state: dict[str, Any], tickers: list[Ticker], extra_errors
     status = state.setdefault("api_status", {})
     errors = set(api_error_labels(tickers, extra_errors))
     observed = {ticker.exchange for ticker in tickers}
-    observed.update({"USDT/KRW", "F&G", "Ranks", "Dominance", "Crypto CAP", "Hashrate", "TX", "Wallet", "Candles", "BTC"})
+    observed.update({"USDT/KRW", "F&G", "Ranks", "Dominance", "Crypto CAP", "Hashrate", "TX", "Wallet", "Candles", "BTC", "Trend"})
     for label in sorted(observed):
         item = status.setdefault(label, {})
         if label in errors:
@@ -2267,7 +2343,7 @@ def caption_summary_row(label: str, value: str, value_width: int) -> str:
     return f"{pad_right(label, 7)} {fitted_value}"
 
 
-def caption_separator(width: int = 6) -> str:
+def caption_separator(width: int = 3) -> str:
     return "-" * width
 
 
@@ -2282,7 +2358,7 @@ def caption_html(body_lines: list[str]) -> str:
 
 def fit_caption_html(body_lines: list[str], max_bytes: int = 1010) -> str:
     fitted = list(body_lines)
-    optional_prefixes = ("Alerts", "Ranks", "Kimchi", "Basis", "API", "Data", "Alert")
+    optional_prefixes = ("Alerts", "Ranks", "Kimchi", "Basis", "API", "Data", "Alert", "F&G")
     for prefix in optional_prefixes:
         caption = caption_html(fitted)
         if len(caption.encode("utf-8")) <= max_bytes:
@@ -2307,6 +2383,7 @@ def render_caption(
     rank_deltas: dict[str, int] | None = None,
     transaction_count: int | None = None,
     wallet_summary: dict[str, Any] | None = None,
+    trends: dict[str, float | None] | None = None,
 ) -> str:
     settings = settings or DEFAULT_SETTINGS
     summary_deltas = summary_deltas or {}
@@ -2322,6 +2399,7 @@ def render_caption(
 
     market_rows: list[tuple[str, str]] = []
     ranking_rows: list[tuple[str, str]] = []
+    trending_rows: list[tuple[str, str]] = []
     dominance_rows: list[tuple[str, str]] = []
     crypto_cap_rows: list[tuple[str, str]] = []
     network_rows: list[tuple[str, str]] = []
@@ -2348,6 +2426,8 @@ def render_caption(
                 ("CG", rank_value(global_ranks.coingecko, rank_deltas.get("cg_rank"))),
             ]
         )
+    if trends:
+        trending_rows.append(("KAS", fmt_trending(trends)))
     if market_dominance is not None:
         dominance_rows.extend(
             [
@@ -2372,7 +2452,7 @@ def render_caption(
     api_text = api_performance_text(api_performance)
     if api_text and settings.get("show_api_quality", True):
         network_rows.append(("API", api_text))
-    event_rows.append(("Toccata", fmt_countdown(TOCATA_HARDFORK_AT, display_dt)))
+    event_rows.append(("Toccata", event_countdown_text(TOCATA_HARDFORK_AT, display_dt)))
     if hashrate_ths is not None:
         network_rows.append(("HR", metric_with_delta(fmt_hashrate(hashrate_ths), summary_deltas, "hashrate_ths")))
     if transaction_count is not None:
@@ -2394,6 +2474,16 @@ def render_caption(
         body_lines.append("Market")
         for row in format_caption_summary_rows(market_rows):
             body_lines.append(row)
+    if event_rows:
+        body_lines.append(separator)
+        body_lines.append("Event")
+        for row in format_caption_summary_rows(event_rows):
+            body_lines.append(row)
+    if trending_rows:
+        body_lines.append(separator)
+        body_lines.append("Trending")
+        for row in format_caption_summary_rows(trending_rows):
+            body_lines.append(row)
     if ranking_rows:
         body_lines.append(separator)
         body_lines.append("Ranking")
@@ -2413,11 +2503,6 @@ def render_caption(
         body_lines.append(separator)
         body_lines.append("Network")
         for row in format_caption_summary_rows(network_rows):
-            body_lines.append(row)
-    if event_rows:
-        body_lines.append(separator)
-        body_lines.append("Event")
-        for row in format_caption_summary_rows(event_rows):
             body_lines.append(row)
     if wallet_rows:
         body_lines.append(separator)
@@ -2514,9 +2599,11 @@ def render_chart(
         lows = [candle.low for candle in candles]
         highs = [candle.high for candle in candles]
         min_price, max_price = min(lows), max(highs)
-        padding = (max_price - min_price) * 0.08 or 0.0001
-        min_price -= padding
-        max_price += padding
+        price_range = max_price - min_price
+        top_padding = price_range * 0.08 or 0.0001
+        bottom_padding = price_range * 0.16 or 0.0001
+        min_price -= bottom_padding
+        max_price += top_padding
 
         def y_for(price: float) -> float:
             return chart_box[3] - 22 - ((price - min_price) / (max_price - min_price)) * (chart_box[3] - chart_box[1] - 44)
@@ -2549,24 +2636,38 @@ def render_chart(
 
         end_label_slots: list[tuple[float, float]] = []
 
+        def reserve_end_label_slot(label_y: float, label_height: float) -> None:
+            end_label_slots.append((label_y, label_y + label_height))
+            end_label_slots.sort()
+
+        def overlaps_end_label_slot(label_y: float, label_height: float) -> bool:
+            label_bottom = label_y + label_height
+            return any(label_y < used_bottom + 6 and label_bottom > used_top - 6 for used_top, used_bottom in end_label_slots)
+
+        def place_end_label(y: float, label_height: float) -> float:
+            min_y = chart_box[1] + 8
+            max_y = chart_box[3] - label_height - 8
+            preferred = max(min_y, min(y - label_height / 2, max_y))
+            candidates = [preferred]
+            for used_top, used_bottom in end_label_slots:
+                candidates.extend([used_top - label_height - 6, used_bottom + 6])
+            candidates = [max(min_y, min(candidate, max_y)) for candidate in candidates]
+            candidates = sorted(set(round(candidate, 2) for candidate in candidates), key=lambda candidate: abs((candidate + label_height / 2) - y))
+            for candidate in candidates:
+                if not overlaps_end_label_slot(candidate, label_height):
+                    return candidate
+            return preferred
+
         def draw_end_label(x: float, y: float, text: str, fill: str) -> None:
             pad_x, pad_y = 8, 5
             bbox = draw.textbbox((0, 0), text, font=small_font)
             label_width = bbox[2] - bbox[0] + pad_x * 2
             label_height = bbox[3] - bbox[1] + pad_y * 2
             label_x = label_left
-            label_y = max(chart_box[1] + 8, min(y - label_height / 2, chart_box[3] - label_height - 8))
-            for used_top, used_bottom in end_label_slots:
-                if label_y < used_bottom + 6 and label_y + label_height > used_top - 6:
-                    label_y = used_bottom + 6
-            if label_y + label_height > chart_box[3] - 8:
-                label_y = chart_box[3] - label_height - 8
-                for used_top, used_bottom in reversed(end_label_slots):
-                    if label_y < used_bottom + 6 and label_y + label_height > used_top - 6:
-                        label_y = used_top - label_height - 6
-            label_y = max(chart_box[1] + 8, min(label_y, chart_box[3] - label_height - 8))
-            end_label_slots.append((label_y, label_y + label_height))
-            draw.line((x + 6, y, label_x - 8, y), fill=fill, width=1)
+            label_y = place_end_label(y, label_height)
+            reserve_end_label_slot(label_y, label_height)
+            label_mid_y = label_y + label_height / 2
+            draw.line((x + 6, y, label_x - 8, label_mid_y), fill=fill, width=1)
             draw.rounded_rectangle(
                 (label_x, label_y, label_x + label_width, label_y + label_height),
                 radius=5,
@@ -2664,6 +2765,7 @@ def render_chart(
             tx_label_x = label_left
             tx_label_y = min(chart_box[3] - tx_height - 8, bar_panel_mid + 8)
             tx_anchor_y = min(bar_panel_bottom - 8, bar_panel_mid + last_transaction_height)
+            reserve_end_label_slot(tx_label_y, tx_height)
             draw.line((last_transaction_x + 6, tx_anchor_y, tx_label_x - 8, tx_label_y + tx_height / 2), fill="#5f7eb6", width=1)
             draw.rounded_rectangle(
                 (tx_label_x, tx_label_y, tx_label_x + tx_width, tx_label_y + tx_height),
@@ -2688,6 +2790,7 @@ def render_chart(
             hashrate_height = hashrate_bbox[3] - hashrate_bbox[1] + hashrate_pad_y * 2
             hashrate_label_x = label_left
             hashrate_label_y = max(bar_panel_top + 4, bar_panel_mid - hashrate_height - 8)
+            reserve_end_label_slot(hashrate_label_y, hashrate_height)
             draw.rounded_rectangle(
                 (
                     hashrate_label_x,
@@ -2749,7 +2852,7 @@ def render_chart(
             draw.text((x - 34, chart_box[3] + 16), label, fill="#9aa4b2", font=small_font)
 
         draw.text((chart_box[0] + 28, chart_box[1] + 18), f"High {max(highs):.6f}", fill="#9aa4b2", font=small_font)
-        draw.text((chart_box[0] + 28, chart_box[3] - 48), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
+        draw.text((chart_box[0] + 250, chart_box[1] + 18), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
     else:
         draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
@@ -3022,6 +3125,14 @@ def run_once(dry_run: bool = False) -> None:
         print(f"candle fallback: {exc}")
         run_errors.append("Candles")
         candles = cached_candles(state, "KAS_USDT:1m:24h") or history_as_candles(history)
+    try:
+        trend_candles_1d = fetch_gate_candles("KAS_USDT", hours=31 * 24, interval="1d")
+        cache_candles(state, "KAS_USDT:1d:31d", trend_candles_1d)
+    except Exception as exc:
+        print(f"trend fallback: {exc}")
+        run_errors.append("Trend")
+        trend_candles_1d = cached_candles(state, "KAS_USDT:1d:31d")
+    trends = trend_summary(candles, trend_candles_1d)
     btc_candles: list[Candle] = []
     try:
         btc_candles = fetch_gate_candles("BTC_USDT")
@@ -3068,6 +3179,7 @@ def run_once(dry_run: bool = False) -> None:
         rank_deltas,
         transaction_count,
         wallet_summary,
+        trends,
     )
     chart_hashrate_points = hashrate_points if settings.get("show_aux_panel", True) else []
     chart_transaction_points = transaction_points if settings.get("show_aux_panel", True) else []
@@ -3080,7 +3192,7 @@ def run_once(dry_run: bool = False) -> None:
         chart_transaction_points,
         display_dt,
         error_labels,
-        chart_badges(tickers, alert_text, wallet_summary, transaction_count),
+        chart_badges(tickers, alert_text, wallet_summary, transaction_count, display_dt),
     )
     CHART_PATH.write_bytes(chart_png)
 
