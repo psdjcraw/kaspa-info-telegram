@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -29,7 +30,7 @@ CHART_PATH = ROOT / "kaspa-chart.png"
 LOG_PATH = ROOT / "ticker.log"
 ERR_LOG_PATH = ROOT / "ticker.err.log"
 KST = timezone(timedelta(hours=9))
-IMAGE_SCALE = 1.3
+IMAGE_SCALE = 1.0
 TRANSACTION_BUCKET_SECONDS = 60
 TOCATA_HARDFORK_AT = datetime(2026, 6, 30, 16, 15, tzinfo=timezone.utc)
 MARKET_RANK_CACHE_SECONDS = 60
@@ -131,6 +132,10 @@ class CryptoCaps:
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def log(message: str) -> None:
+    print(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S KST')} {message}", flush=True)
 
 
 def telegram_chat_id() -> str:
@@ -1421,6 +1426,15 @@ def candle_pct_change(candles: list[Candle], seconds: int) -> float | None:
     return pct_change(latest.close, baseline.close)
 
 
+def kas_btc_ratio_points(kas_candles: list[Candle], btc_candles: list[Candle]) -> list[tuple[int, float]]:
+    btc_by_ts = {candle.ts: candle.close for candle in btc_candles if candle.close > 0}
+    return [
+        (candle.ts, candle.close / btc_close * 100_000_000)
+        for candle in kas_candles
+        if candle.close > 0 and (btc_close := btc_by_ts.get(candle.ts)) is not None and btc_close > 0
+    ]
+
+
 def trend_summary(candles_1m: list[Candle], candles_1d: list[Candle]) -> dict[str, float | None]:
     return {
         "15m": candle_pct_change(candles_1m, 15 * 60),
@@ -1512,6 +1526,13 @@ def compact_kas(value: float | None) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.2f}K KAS"
     return f"{value:.2f} KAS"
+
+
+def signed_compact_kas(value: float | None) -> str:
+    if value is None:
+        return "wait"
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}{compact_kas(abs(value)).replace(' KAS', '')}"
 
 
 def quote_volume_millions(value: float | None) -> str:
@@ -2460,13 +2481,21 @@ def render_caption(
     if wallet_summary:
         wallet_rows.append(("1st 🐋", compact_kas(as_float(wallet_summary.get("balance")))))
         ranges = []
-        for label, key in (("24h", "delta_24h"), ("7d", "delta_7d"), ("30d", "delta_30d")):
-            delta = wallet_summary.get(key)
-            ranges.append(f"{label} {caption_signed_percent(delta, precision=1) if delta is not None else 'wait'}")
+        for label, amount_key, delta_key in (
+            ("24h", "amount_24h", "delta_24h"),
+            ("7d", "amount_7d", "delta_7d"),
+            ("30d", "amount_30d", "delta_30d"),
+        ):
+            amount = as_float(wallet_summary.get(amount_key))
+            delta = wallet_summary.get(delta_key)
+            if delta is None:
+                ranges.append(f"{label} {signed_compact_kas(amount)}")
+            else:
+                ranges.append(f"{label} {signed_compact_kas(amount)}/{caption_signed_percent(delta, precision=1)}")
         wallet_rows.append(("WΔ", " ".join(ranges)))
         alert = wallet_summary.get("alert")
         if isinstance(alert, dict):
-            wallet_rows.append(("⚠️", f"{alert.get('direction')} {compact_kas(as_float(alert.get('amount')))}"))
+            wallet_rows.append(("Latest", f"{alert.get('direction')} {compact_kas(as_float(alert.get('amount')))}"))
 
     separator = caption_separator()
     body_lines = [now, separator]
@@ -2562,6 +2591,7 @@ def render_chart(
     hashrate_points: list[HashratePoint] | None = None,
     hashrate_ths: float | None = None,
     btc_candles: list[Candle] | None = None,
+    kas_btc_points: list[tuple[int, float]] | None = None,
     transaction_points: list[TransactionPoint] | None = None,
     display_dt: datetime | None = None,
     api_errors: list[str] | None = None,
@@ -2588,7 +2618,7 @@ def render_chart(
         draw.text((badge_x + 10, 75 - bbox[1]), badge_text, fill="#dfe7f3", font=small_font)
         badge_x += badge_width + 10
 
-    chart_box = (84, 142, 1516, 590)
+    chart_box = (160, 142, 1516, 590)
     draw.rounded_rectangle(chart_box, radius=12, fill="#0b0e13", outline="#2b3342", width=2)
 
     for index in range(1, 5):
@@ -2608,11 +2638,66 @@ def render_chart(
         def y_for(price: float) -> float:
             return chart_box[3] - 22 - ((price - min_price) / (max_price - min_price)) * (chart_box[3] - chart_box[1] - 44)
 
+        actual_high = max(highs)
+        actual_low = min(lows)
+        side_marker_x = 24
+        side_marker_width = 118
+        side_marker_height = 56
+
+        def draw_side_price_marker(label: str, price: float, y: float, marker_y: float, color: str) -> None:
+            price_text = f"{price:.6f}"
+            label_bbox = draw.textbbox((0, 0), label, font=small_font)
+            price_font = load_font(27, bold=True)
+            price_bbox = draw.textbbox((0, 0), price_text, font=price_font)
+            draw.line(
+                (
+                    side_marker_x + side_marker_width + 8,
+                    marker_y + side_marker_height / 2,
+                    chart_box[0] - 8,
+                    y,
+                ),
+                fill=color,
+                width=1,
+            )
+            draw.rounded_rectangle(
+                (
+                    side_marker_x,
+                    marker_y,
+                    side_marker_x + side_marker_width,
+                    marker_y + side_marker_height,
+                ),
+                radius=7,
+                fill="#101722",
+                outline=color,
+                width=1,
+            )
+            draw.text(
+                (
+                    side_marker_x + (side_marker_width - (label_bbox[2] - label_bbox[0])) / 2,
+                    marker_y + 6 - label_bbox[1],
+                ),
+                label,
+                fill="#9aa4b2",
+                font=small_font,
+            )
+            draw.text(
+                (
+                    side_marker_x + (side_marker_width - (price_bbox[2] - price_bbox[0])) / 2,
+                    marker_y + 29 - price_bbox[1],
+                ),
+                price_text,
+                fill="#f3f6fb",
+                font=price_font,
+            )
+
+        draw_side_price_marker("High", actual_high, y_for(actual_high), chart_box[1] + 18, "#38d87c")
+        draw_side_price_marker("Low", actual_low, y_for(actual_low), chart_box[3] - side_marker_height - 18, "#ff5c72")
+
         inner_left = chart_box[0] + 30
         label_left = chart_box[2] - 360
         inner_right = label_left - 28
         step = (inner_right - inner_left) / max(len(candles), 1)
-        candle_width = max(2, min(9, int(step * 0.68)))
+        candle_width = 1
         candle_start_ts = candles[0].ts
         candle_end_ts = candles[-1].ts
 
@@ -2836,12 +2921,31 @@ def render_chart(
         btc_label: tuple[float, float, str, str] | None = None
         if len(visible_btc) >= 2:
             line_points = scaled_line_points([(candle.ts, candle.close) for candle in visible_btc])
-            draw.line(line_points, fill="#42a5ff", width=3, joint="curve")
+            draw.line(line_points, fill="#42a5ff", width=1, joint="curve")
             btc_label = (line_points[-1][0], line_points[-1][1], f"BTC {fmt_btc_price(visible_btc[-1].close)}", "#78bdff")
+
+        kas_btc_points = kas_btc_points or []
+        visible_kas_btc = [
+            (ts, ratio)
+            for ts, ratio in kas_btc_points
+            if candle_start_ts <= ts <= candle_end_ts and ratio > 0
+        ]
+        kas_btc_label: tuple[float, float, str, str] | None = None
+        if len(visible_kas_btc) >= 2:
+            line_points = scaled_line_points(visible_kas_btc)
+            draw.line(line_points, fill="#ff3045", width=1, joint="curve")
+            kas_btc_label = (
+                line_points[-1][0],
+                line_points[-1][1],
+                f"KASUSD/BTCUSD*1e8 {visible_kas_btc[-1][1]:.2f}",
+                "#ff6473",
+            )
 
         draw_end_label(last_x, y_for(last.close), f"KAS {last.close:.6f}", "#f3f6fb")
         if btc_label:
             draw_end_label(*btc_label)
+        if kas_btc_label:
+            draw_end_label(*kas_btc_label)
 
         label_indexes = [0, len(candles) // 4, len(candles) // 2, (len(candles) * 3) // 4, len(candles) - 1]
         for label_index in label_indexes:
@@ -2851,8 +2955,6 @@ def render_chart(
             label = datetime.fromtimestamp(candle.ts, tz=KST).strftime("%H:%M")
             draw.text((x - 34, chart_box[3] + 16), label, fill="#9aa4b2", font=small_font)
 
-        draw.text((chart_box[0] + 28, chart_box[1] + 18), f"High {max(highs):.6f}", fill="#9aa4b2", font=small_font)
-        draw.text((chart_box[0] + 250, chart_box[1] + 18), f"Low {min(lows):.6f}", fill="#9aa4b2", font=small_font)
     else:
         draw.text((chart_box[0] + 380, chart_box[1] + 160), "collecting candle history...", fill="#9aa4b2", font=text_font)
 
@@ -2965,10 +3067,16 @@ def render_chart(
     return output.getvalue()
 
 
-def telegram_api(method: str, fields: dict[str, Any], files: dict[str, tuple[str, bytes, str]] | None = None) -> Any:
+def telegram_api(
+    method: str,
+    fields: dict[str, Any],
+    files: dict[str, tuple[str, bytes, str]] | None = None,
+    timeout: float | None = None,
+) -> Any:
     token = env("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    timeout = timeout or as_float(env("TELEGRAM_API_TIMEOUT_SECONDS")) or 90.0
 
     url = f"https://api.telegram.org/bot{token}/{method}"
     if not files:
@@ -2996,7 +3104,7 @@ def telegram_api(method: str, fields: dict[str, Any], files: dict[str, tuple[str
         )
 
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -3008,6 +3116,34 @@ def telegram_api(method: str, fields: dict[str, Any], files: dict[str, tuple[str
         raise RuntimeError(f"Telegram {method} failed: {description}") from exc
     if not payload.get("ok"):
         raise RuntimeError(payload)
+    return payload["result"]
+
+
+def telegram_edit_caption_curl(chat_id: str, message_id: int | str, caption: str, timeout: float) -> Any:
+    token = env("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    command = [
+        "curl",
+        "-sS",
+        "--max-time",
+        str(int(timeout)),
+        "--data-urlencode",
+        f"chat_id={chat_id}",
+        "--data-urlencode",
+        f"message_id={message_id}",
+        "--data-urlencode",
+        f"caption={caption}",
+        "--data-urlencode",
+        "parse_mode=HTML",
+        f"https://api.telegram.org/bot{token}/editMessageCaption",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 3)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or f"curl exit {result.returncode}").strip())
+    payload = json.loads(result.stdout)
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram editMessageCaption failed: {payload.get('description', payload)}")
     return payload["result"]
 
 
@@ -3030,6 +3166,19 @@ def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) 
 
     message_id = state.get("message_id")
     if message_id:
+        now = int(time.time())
+        media_timeout = as_float(env("TELEGRAM_MEDIA_TIMEOUT_SECONDS")) or 8.0
+        caption_timeout = as_float(env("TELEGRAM_CAPTION_TIMEOUT_SECONDS")) or 12.0
+        media_retry_seconds = int(as_float(env("TELEGRAM_MEDIA_RETRY_SECONDS")) or 10 * 60)
+
+        def edit_caption_only() -> None:
+            telegram_edit_caption_curl(chat_id, message_id, caption, caption_timeout)
+
+        media_disabled_until = int(state.get("telegram_media_disabled_until", 0) or 0)
+        if now < media_disabled_until:
+            edit_caption_only()
+            return
+
         media = json.dumps(
             {
                 "type": "photo",
@@ -3039,11 +3188,18 @@ def send_or_edit_message(state: dict[str, Any], chart_png: bytes, caption: str) 
             },
             ensure_ascii=False,
         )
-        telegram_api(
-            "editMessageMedia",
-            {"chat_id": chat_id, "message_id": message_id, "media": media},
-            {"chart": ("kaspa-chart.png", chart_png, "image/png")},
-        )
+        try:
+            telegram_api(
+                "editMessageMedia",
+                {"chat_id": chat_id, "message_id": message_id, "media": media},
+                {"chart": ("kaspa-chart.png", chart_png, "image/png")},
+                timeout=media_timeout,
+            )
+        except Exception as exc:
+            log(f"editMessageMedia failed, caption fallback: {exc}")
+            state["telegram_media_disabled_until"] = now + media_retry_seconds
+            save_state(state)
+            edit_caption_only()
         return
 
     result = telegram_api(
@@ -3141,6 +3297,7 @@ def run_once(dry_run: bool = False) -> None:
         print(f"btc fallback: {exc}")
         run_errors.append("BTC")
         btc_candles = cached_candles(state, "BTC_USDT:1m:24h")
+    kas_btc_points = kas_btc_ratio_points(candles, btc_candles)
     error_labels = update_api_status(state, tickers, run_errors)
     api_performance = update_api_performance(state)
     status_text = data_status_text(state, error_labels)
@@ -3189,6 +3346,7 @@ def run_once(dry_run: bool = False) -> None:
         chart_hashrate_points,
         hashrate_ths,
         btc_candles,
+        kas_btc_points,
         chart_transaction_points,
         display_dt,
         error_labels,
@@ -3228,9 +3386,9 @@ def loop(interval: int, dry_run: bool = False) -> None:
             run_once(dry_run=dry_run)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            print(f"telegram/http error {exc.code}: {body[:300]}")
+            log(f"telegram/http error {exc.code}: {body[:300]}")
         except Exception as exc:
-            print(f"error: {exc}")
+            log(f"error: {exc}")
 
 
 def main() -> None:

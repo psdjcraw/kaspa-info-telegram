@@ -5,10 +5,13 @@
 ## 동작 방식
 
 - public 거래소 ticker API에서 KAS 시세를 가져옵니다.
-- 최근 KAS/USDT 평균 가격을 `state.json`에 저장해 간단한 차트 PNG를 만듭니다.
+- Gate 1분봉 KAS/USDT 캔들로 차트 PNG를 만듭니다.
+- 차트에는 KAS high/low 마커, BTC/USDT 보조선, `KASUSD/BTCUSD*1e8` SATS 비율선을 함께 표시합니다.
+- KAS, BTC, SATS 가격선은 모두 1px로 그려 보조선이 캔들을 덮지 않게 합니다.
 - 볼륨 증감률은 UTC+0 날짜 기준으로, 해당 UTC 일자의 첫 조회값 대비 증가율로 표시합니다.
 - 첫 실행 때는 `sendPhoto`로 메시지를 하나 보냅니다.
 - 이후에는 저장된 `message_id`를 사용해 `editMessageMedia`로 같은 메시지를 수정합니다.
+- Telegram 미디어 수정이 느리거나 실패하면 일정 시간 caption-only 갱신으로 fallback합니다.
 - 동일한 렌더링 결과면 Telegram API 호출을 건너뜁니다.
 
 현재 수집 거래소:
@@ -35,6 +38,9 @@ python3 -m pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN="123456:..."
 export TELEGRAM_CHAT_ID="@your_channel_or_chat_id"
 export TICKER_INTERVAL_SECONDS=60
+export TELEGRAM_MEDIA_TIMEOUT_SECONDS=8
+export TELEGRAM_CAPTION_TIMEOUT_SECONDS=12
+export TELEGRAM_MEDIA_RETRY_SECONDS=600
 ```
 
 채널에 올리려면 봇을 채널 admin으로 추가하고 메시지 게시 권한을 줘야 합니다.
